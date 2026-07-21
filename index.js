@@ -1,51 +1,52 @@
 #!/usr/bin/env node
 /*
- * anastasy (dbq) — CLI reversível para SQL Server
- * -----------------------------------------------
- * Executa SELECT/INSERT/UPDATE/DELETE de forma estruturada e mantém um
- * "git-like" undo journal: toda mutação grava o estado anterior (ou as PKs
- * inseridas) para permitir revert.
+ * anastasy (dbq) — reversible CLI for SQL Server
+ * ----------------------------------------------
+ * Runs SELECT/INSERT/UPDATE/DELETE in a structured way and keeps a
+ * "git-like" undo journal: every mutation records the prior state (or the
+ * inserted PKs) so it can be reverted.
  *
- * Armazenamento: SQLite local (node:sqlite, embutido no Node 22+) em dbq.sqlite —
- *   journal (com snapshot gzipado), schema_cache e result_cache.
+ * Storage: local SQLite (node:sqlite, built into Node 22+) in dbq.sqlite —
+ *   journal (with a gzipped snapshot), schema_cache and result_cache.
  *
- * Uso:
- *   node index.js <comando> [opções]
+ * Usage:
+ *   node index.js <command> [options]
  *
- * Comandos:
- *   conns                                  Lista as conexões configuradas
- *   query    <conn> "<SELECT ...>"         SQL somente-leitura (SELECT/WITH) [--cache [ttl]]
+ * Commands:
+ *   conns                                  List the configured connections
+ *   query    <conn> "<SELECT ...>"         Read-only SQL (SELECT/WITH) [--cache [ttl]]
  *   select   <conn> --table T [--schema sch] [--where "..."] [--top N] [--columns "a,b"]
- *   count    <conn> --table T [--where "..."]        Só a contagem (barato em tokens)
- *   describe <conn> <table> [--schema sch] [--refresh]   Colunas/tipos (usa schema_cache)
- *   auth     <conn> [--password <senha>] [--ttl <min>] [--clear]
- *                                          Cacheia senha de sessão (conexões sem Password= no .env)
+ *   count    <conn> --table T [--where "..."]        Just the count (cheap in tokens)
+ *   describe <conn> <table> [--schema sch] [--refresh]   Columns/types (uses schema_cache)
+ *   auth     <conn> [--password <pwd>] [--ttl <min>] [--clear]
+ *                                          Cache a session password (connections without Password= in .env)
  *   insert   <conn> --table T [--schema sch] --values '{json}' [--pk Id]
  *   update   <conn> --table T [--schema sch] --set '{json}' --where "..." [--pk Id]
  *   delete   <conn> --table T [--schema sch] --where "..." [--pk Id]
- *   ddl      <conn> "<CREATE/ALTER/DROP ...>" | --file <a.sql>   DDL (só dev/hml) [--yes] [--no-tx]
- *   log [--all]                            Lista o histórico de mutações
- *   show     <id> [--full]                 Detalha uma entrada (compacto; --full = snapshot)
- *   revert   <id>                          Desfaz uma mutação
- *   revert-last                            Desfaz a última mutação não-revertida
- *   cache-clear                            Limpa o result_cache
+ *   ddl      <conn> "<CREATE/ALTER/DROP ...>" | --file <a.sql>   DDL (dev/hml only) [--yes] [--no-tx]
+ *   log [--all]                            List the mutation history
+ *   show     <id> [--full]                 Detail one entry (compact; --full = snapshot)
+ *   revert   <id>                          Undo one mutation
+ *   revert-last                            Undo the most recent non-reverted mutation
+ *   cache-clear                            Clear the result_cache
  *
- * Saída (economia de tokens):
+ * Output (token economy):
  *   --format table|tsv|jsonl|json|count    (default: table)
- *   --full                                 Não esconde colunas nulas
- *   --top N                                Limite de linhas (default 50, máx 500)
+ *   --full                                 Do not hide null columns
+ *   --top N                                Row limit (default 50, max 500)
  *
- * Segurança:
- *   - Mutações exigem --yes (sem isso, faz dry-run e mostra o snapshot/efeito).
- *   - Conexões readonly (claude_reader) recusam mutações.
- *   - Conexões prod recusam mutações sem --force-prod (evite!).
- *   - ddl só roda em conexões de ESCRITA não-prod (dev/hml); é BLOQUEADO em prod
- *     (sem override) e não é revertível automaticamente pelo journal (op=ddl, undo=none).
- *   - Conexão SEM Password= no .env usa senha de sessão: resolvida via env DBQ_PASSWORD,
- *     cache do 'auth' (com TTL) ou prompt interativo. Nunca fica em arquivo de config.
+ * Safety:
+ *   - Mutations require --yes (without it, a dry-run showing the snapshot/effect).
+ *   - Read-only connections (reader user) refuse mutations.
+ *   - Prod connections refuse mutations without --force-prod (avoid it!).
+ *   - ddl runs only on non-prod WRITE connections (dev/hml); it is BLOCKED in prod
+ *     (no override) and is not auto-revertible by the journal (op=ddl, undo=none).
+ *   - A connection WITHOUT Password= in .env uses a session password: resolved via the
+ *     DBQ_PASSWORD env var, the 'auth' cache (with a TTL) or an interactive prompt.
+ *     It never lives in a config file.
  */
 
-// node:sqlite é experimental — silencia só esse warning (polui stdout/tokens).
+// node:sqlite is experimental — silence only that warning (it pollutes stdout/tokens).
 const _emitWarning = process.emitWarning.bind(process);
 process.emitWarning = (warning, ...rest) => {
   const msg = typeof warning === 'string' ? warning : warning && warning.message;
@@ -63,7 +64,7 @@ let sql;
 try {
   sql = require('mssql');
 } catch (e) {
-  console.error("Dependência ausente: rode 'npm install' em " + __dirname);
+  console.error("Missing dependency: run 'npm install' in " + __dirname);
   process.exit(1);
 }
 
@@ -74,7 +75,7 @@ const ENV_PATH = path.join(ROOT, '.env');
 const DEFAULT_SCHEMA = 'sch';
 const DEFAULT_TOP = 50;
 const MAX_TOP = 500;
-const DEFAULT_CACHE_TTL = 300; // segundos
+const DEFAULT_CACHE_TTL = 300; // seconds
 
 // ---------------------------------------------------------------- args ----
 function parseArgs(argv) {
@@ -152,7 +153,7 @@ function db() {
 }
 
 // --------------------------------------------------------- connections ----
-// Converte uma connection string ADO.NET no formato interno usado pelo mssql.
+// Converts an ADO.NET connection string into the internal shape used by mssql.
 function parseConnString(cs) {
   const map = {};
   cs.split(';').forEach(part => {
@@ -171,7 +172,7 @@ function parseConnString(cs) {
   };
 }
 
-// Lê um .env (KEY=connstring). Sufixos opcionais <NOME>_READONLY / <NOME>_PROD.
+// Reads a .env (KEY=connstring). Optional suffixes <NAME>_READONLY / <NAME>_PROD.
 function parseEnv(text) {
   const raw = {};
   for (let line of text.split(/\r?\n/)) {
@@ -187,7 +188,7 @@ function parseEnv(text) {
   const conns = {};
   for (const [key, val] of Object.entries(raw)) {
     if (/_(READONLY|PROD)$/i.test(key)) continue;
-    if (!/data source\s*=|server\s*=/i.test(val)) continue; // apenas connection strings
+    if (!/data source\s*=|server\s*=/i.test(val)) continue; // connection strings only
     const p = parseConnString(val);
     const isReader = (p.user || '').toLowerCase().includes('reader');
     const looksProd = /prd|prod|pro-/i.test(`${p.database || ''} ${p.server || ''}`);
@@ -206,10 +207,10 @@ function loadConnections() {
     try { conns = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')).connections || {}; } catch (e) {}
   }
   if (fs.existsSync(ENV_PATH)) {
-    Object.assign(conns, parseEnv(fs.readFileSync(ENV_PATH, 'utf8'))); // .env tem precedência
+    Object.assign(conns, parseEnv(fs.readFileSync(ENV_PATH, 'utf8'))); // .env takes precedence
   }
   if (Object.keys(conns).length === 0) {
-    fail('Nenhuma conexão configurada. Crie .env (veja .env.example) ou connections.json.');
+    fail('No connection configured. Create .env (see .env.example) or connections.json.');
   }
   return conns;
 }
@@ -217,13 +218,13 @@ function loadConnections() {
 function getConn(name) {
   const conns = loadConnections();
   const c = conns[name];
-  if (!c) fail(`Conexão "${name}" não existe. Use 'conns' para listar.`);
+  if (!c) fail(`Connection "${name}" does not exist. Use 'conns' to list.`);
   return c;
 }
 
-// --- senha de sessão (conexões sem Password= no .env) ---
-// Cache em dbq.sqlite (base64 = ofuscação, não criptografia — mesmo nível do .env,
-// mas com TTL e fora de arquivo durável de config).
+// --- session password (connections without Password= in .env) ---
+// Cached in dbq.sqlite (base64 = obfuscation, not encryption — same level as .env,
+// but with a TTL and outside a durable config file).
 function getCachedCredential(name) {
   const row = db().prepare('SELECT secret, expires_at FROM credentials WHERE connection=?').get(name);
   if (!row) return null;
@@ -243,7 +244,7 @@ function promptHidden(msg) {
     const readline = require('readline');
     process.stderr.write(msg);
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr, terminal: true });
-    rl._writeToOutput = () => {}; // não ecoa a senha
+    rl._writeToOutput = () => {}; // do not echo the password
     rl.question('', ans => { rl.close(); process.stderr.write('\n'); resolve(ans); });
   });
 }
@@ -252,10 +253,10 @@ async function resolveSessionPassword(name) {
   if (process.env.DBQ_PASSWORD) return process.env.DBQ_PASSWORD;
   const cached = getCachedCredential(name);
   if (cached && !cached.expired) return cached.secret;
-  if (process.stdin.isTTY) return promptHidden(`Senha para ${name}: `);
+  if (process.stdin.isTTY) return promptHidden(`Password for ${name}: `);
   fail(cached && cached.expired
-    ? `Credencial de sessão de "${name}" EXPIROU em ${cached.expiresAt}. Rode: dbq auth ${name} --password <senha> [--ttl <min>]`
-    : `Conexão "${name}" usa senha de sessão e não há credencial em cache. Rode: dbq auth ${name} --password <senha> [--ttl <min>]`);
+    ? `Session credential for "${name}" EXPIRED at ${cached.expiresAt}. Run: dbq auth ${name} --password <pwd> [--ttl <min>]`
+    : `Connection "${name}" uses a session password and there is no cached credential. Run: dbq auth ${name} --password <pwd> [--ttl <min>]`);
 }
 
 async function getPool(name, passwordOverride) {
@@ -276,7 +277,7 @@ async function getPool(name, passwordOverride) {
     await pool.connect();
   } catch (e) {
     if (!c.password && !passwordOverride && /login failed/i.test(e.message)) {
-      fail(`Login falhou em "${name}" (${e.message}). A senha de sessão pode ter expirado no servidor — rode: dbq auth ${name} --password <senha>`);
+      fail(`Login failed for "${name}" (${e.message}). The session password may have expired on the server — run: dbq auth ${name} --password <pwd>`);
     }
     throw e;
   }
@@ -286,22 +287,22 @@ async function getPool(name, passwordOverride) {
 function assertWritable(name, flags) {
   const c = getConn(name);
   if (c.readonly) {
-    fail(`Conexão "${name}" é somente-leitura (usuário ${c.user}). Configure uma credencial de escrita em connections.json.`);
+    fail(`Connection "${name}" is read-only (user ${c.user}). Configure a write credential in connections.json.`);
   }
   if (c.prod && !flags['force-prod']) {
-    fail(`Conexão "${name}" é PRODUÇÃO. Mutação bloqueada. (use --force-prod só se tiver absoluta certeza)`);
+    fail(`Connection "${name}" is PRODUCTION. Mutation blocked. (use --force-prod only if you are absolutely sure)`);
   }
 }
 
-// DDL é mais perigoso e não-revertível: só permite em conexões de ESCRITA não-prod
-// (dev/hml). Produção é bloqueada SEM override — DDL de prod vai pela pipeline de migrations.
+// DDL is more dangerous and not revertible: allowed only on non-prod WRITE connections
+// (dev/hml). Production is blocked with NO override — prod DDL goes through the migrations pipeline.
 function assertDdlAllowed(name) {
   const c = getConn(name);
   if (c.readonly) {
-    fail(`Conexão "${name}" é somente-leitura (usuário ${c.user}). DDL exige conexão de escrita (dev/hml).`);
+    fail(`Connection "${name}" is read-only (user ${c.user}). DDL requires a write connection (dev/hml).`);
   }
   if (c.prod) {
-    fail(`Conexão "${name}" é PRODUÇÃO. DDL é bloqueado em prod (sem override). Use a pipeline de migrations.`);
+    fail(`Connection "${name}" is PRODUCTION. DDL is blocked in prod (no override). Use the migrations pipeline.`);
   }
 }
 
@@ -338,7 +339,7 @@ function findEntry(id) {
   const d = db();
   let row = d.prepare('SELECT * FROM journal WHERE seq=?').get(Number(id));
   if (!row) row = d.prepare('SELECT * FROM journal WHERE id=?').get(String(id));
-  if (!row) fail(`Entrada de journal "${id}" não encontrada.`);
+  if (!row) fail(`Journal entry "${id}" not found.`);
   return rowToEntry(row);
 }
 
@@ -409,11 +410,11 @@ function cachePut(conn, text, rows, ttl) {
 }
 
 // --------------------------------------------------------------- utils ----
-function fail(msg) { console.error('ERRO: ' + msg); process.exit(1); }
+function fail(msg) { console.error('ERROR: ' + msg); process.exit(1); }
 function qual(schema, table) { return `[${schema}].[${table}]`; }
 function nowIso() { return new Date().toISOString(); }
 
-// Aplica valores de um objeto JS como parâmetros nomeados a um request mssql.
+// Binds a JS object's values as named parameters on an mssql request.
 function bindParams(request, obj, prefix) {
   const names = {};
   let i = 0;
@@ -431,7 +432,7 @@ function clampTop(v) {
   return Math.min(n, MAX_TOP);
 }
 
-// ------------------------------------------------------------ output (A) ----
+// ------------------------------------------------------------ output ----
 function fmtVal(v) {
   if (v === null || v === undefined) return null;
   if (v instanceof Date) return v.toISOString();
@@ -443,7 +444,7 @@ function visibleColumns(rows, full) {
   const cols = Object.keys(rows[0]);
   if (full) return cols;
   const kept = cols.filter(c => rows.some(r => r[c] !== null && r[c] !== undefined));
-  return kept.length ? kept : cols; // não esconde tudo se a(s) linha(s) forem toda(s) nula(s)
+  return kept.length ? kept : cols; // don't hide everything if the row(s) are entirely null
 }
 
 function renderTable(rows, cols) {
@@ -455,11 +456,11 @@ function renderTable(rows, cols) {
   return out.join('\n');
 }
 
-// Imprime um recordset de forma compacta. opts.fromCache → adiciona "cached".
+// Prints a recordset compactly. opts.fromCache → append "cached".
 function printRows(rows, flags, opts = {}) {
   const fmt = (flags.format || 'table').toLowerCase();
   if (fmt === 'count') { console.log(rows ? rows.length : 0); return; }
-  if (!rows || rows.length === 0) { console.log('(0 linhas)'); return; }
+  if (!rows || rows.length === 0) { console.log('(0 rows)'); return; }
 
   const cap = clampTop(flags.top || DEFAULT_TOP);
   const truncated = rows.length > cap;
@@ -486,11 +487,11 @@ function printRows(rows, flags, opts = {}) {
     console.log(renderTable(shown, cols));
   }
 
-  const parts = [`${shown.length}${truncated ? ` de ${rows.length}` : ''} linha(s)`];
-  if (hidden > 0) parts.push(`${hidden} coluna(s) nula(s) ocultada(s) (use --full)`);
+  const parts = [`${shown.length}${truncated ? ` of ${rows.length}` : ''} row(s)`];
+  if (hidden > 0) parts.push(`${hidden} null column(s) hidden (use --full)`);
   if (opts.fromCache) parts.push('cached');
   console.log(`(${parts.join(', ')})`);
-  if (truncated) console.log(`... truncado em ${cap}. use --top N (máx ${MAX_TOP}), refine --where, ou 'count'.`);
+  if (truncated) console.log(`... truncated at ${cap}. use --top N (max ${MAX_TOP}), refine --where, or 'count'.`);
 }
 
 // ------------------------------------------------------------ commands ----
@@ -500,54 +501,54 @@ async function cmdConns() {
     const tags = [c.readonly ? 'readonly' : 'WRITE', c.prod ? 'PROD' : 'nonprod'];
     if (!c.password) {
       const cached = getCachedCredential(name);
-      tags.push(!cached ? 'auth: pendente'
-        : cached.expired ? 'auth: EXPIRADA'
-        : `auth ok até ${cached.expiresAt.slice(11, 16)}Z`);
+      tags.push(!cached ? 'auth: pending'
+        : cached.expired ? 'auth: EXPIRED'
+        : `auth ok until ${cached.expiresAt.slice(11, 16)}Z`);
     }
     console.log(`${name.padEnd(12)} ${c.server} / ${c.database}  [${tags.join(' ')}]  user=${c.user}`);
   }
 }
 
 async function cmdAuth(connName, flags) {
-  if (!connName) fail('uso: auth <conn> [--password <senha>] [--ttl <min>] [--clear]');
+  if (!connName) fail('usage: auth <conn> [--password <pwd>] [--ttl <min>] [--clear]');
   const c = getConn(connName);
   if (flags.clear) {
     const r = db().prepare('DELETE FROM credentials WHERE connection=?').run(connName);
-    console.log(r.changes ? `Credencial de ${connName} removida.` : `Nenhuma credencial em cache para ${connName}.`);
+    console.log(r.changes ? `Credential for ${connName} removed.` : `No cached credential for ${connName}.`);
     return;
   }
   if (c.password) {
-    console.error(`Aviso: "${connName}" tem Password= no .env — o cache do auth não será usado. Remova a senha do .env para ativar a senha de sessão.`);
+    console.error(`Warning: "${connName}" has Password= in .env — the auth cache will not be used. Remove the password from .env to enable the session password.`);
   }
   let password = typeof flags.password === 'string' ? flags.password : null;
   if (!password) {
-    if (!process.stdin.isTTY) fail('Sem terminal interativo: informe --password <senha>.');
-    password = await promptHidden(`Senha para ${connName} (user ${c.user}): `);
+    if (!process.stdin.isTTY) fail('No interactive terminal: pass --password <pwd>.');
+    password = await promptHidden(`Password for ${connName} (user ${c.user}): `);
   }
-  if (!password) fail('Senha vazia.');
+  if (!password) fail('Empty password.');
 
-  // valida conectando de verdade antes de cachear
+  // validate by actually connecting before caching
   const pool = await getPool(connName, password);
   await pool.close();
 
   const ttlMin = Math.max(1, parseInt(flags.ttl, 10) || 480);
   const expires = storeCredential(connName, password, ttlMin);
-  console.log(`OK auth: credencial de ${connName} validada e cacheada até ${expires} (ttl ${ttlMin} min).`);
-  console.log(`Limpar antes do vencimento: dbq auth ${connName} --clear`);
+  console.log(`OK auth: credential for ${connName} validated and cached until ${expires} (ttl ${ttlMin} min).`);
+  console.log(`Clear before expiry: dbq auth ${connName} --clear`);
 }
 
 function ensureSelectOnly(text) {
   const t = text.trim().replace(/^\(+/, '').toLowerCase();
   if (!(t.startsWith('select') || t.startsWith('with') || t.startsWith('exec sp_help') || t.startsWith('declare'))) {
-    fail("'query' só executa leitura (SELECT/WITH). Para mutações use insert/update/delete.");
+    fail("'query' runs reads only (SELECT/WITH). For mutations use insert/update/delete.");
   }
   if (/\b(update|delete|insert|drop|truncate|alter|merge)\b/.test(t) && !t.startsWith('with')) {
-    fail('A query parece conter mutação. Use os comandos estruturados (insert/update/delete) para manter o journal.');
+    fail('The query looks like it contains a mutation. Use the structured commands (insert/update/delete) to keep the journal.');
   }
 }
 
 async function cmdQuery(connName, queryText, flags) {
-  if (!queryText) fail('Informe o SQL: query <conn> "SELECT ..."');
+  if (!queryText) fail('Provide the SQL: query <conn> "SELECT ..."');
   ensureSelectOnly(queryText);
   const ttl = ttlFromFlag(flags.cache);
   if (ttl) {
@@ -566,7 +567,7 @@ async function cmdQuery(connName, queryText, flags) {
 
 async function cmdSelect(connName, flags) {
   const schema = flags.schema || DEFAULT_SCHEMA;
-  const table = flags.table || fail('--table obrigatório');
+  const table = flags.table || fail('--table required');
   const cols = flags.columns ? flags.columns : '*';
   const top = clampTop(flags.top || DEFAULT_TOP);
   const where = flags.where ? `WHERE ${flags.where}` : '';
@@ -589,7 +590,7 @@ async function cmdSelect(connName, flags) {
 
 async function cmdCount(connName, flags) {
   const schema = flags.schema || DEFAULT_SCHEMA;
-  const table = flags.table || fail('--table obrigatório');
+  const table = flags.table || fail('--table required');
   const where = flags.where ? `WHERE ${flags.where}` : '';
   const q = `SELECT COUNT(*) AS n FROM ${qual(schema, table)} ${where}`.trim();
   const pool = await getPool(connName);
@@ -603,12 +604,12 @@ async function cmdCount(connName, flags) {
 
 async function cmdDescribe(connName, table, flags) {
   const schema = flags.schema || DEFAULT_SCHEMA;
-  const tbl = table || flags.table || fail('uso: describe <conn> <table> [--schema sch]');
+  const tbl = table || flags.table || fail('usage: describe <conn> <table> [--schema sch]');
   const pool = await getPool(connName);
   try {
     const meta = await getTableMeta(pool, connName, schema, tbl, !!flags.refresh);
-    if (!meta) fail(`Tabela ${schema}.${tbl} não encontrada (confira --schema).`);
-    console.log(`${schema}.${tbl}  (${meta.length} colunas)`);
+    if (!meta) fail(`Table ${schema}.${tbl} not found (check --schema).`);
+    console.log(`${schema}.${tbl}  (${meta.length} columns)`);
     for (const c of meta) {
       const len = c.maxlen && c.maxlen > 0 ? `(${c.maxlen})` : (c.maxlen === -1 ? '(max)' : '');
       const tags = [c.pk ? 'PK' : '', c.identity ? 'IDENTITY' : '', c.nullable ? '' : 'NOT NULL'].filter(Boolean).join(' ');
@@ -622,31 +623,31 @@ async function cmdDescribe(connName, table, flags) {
 async function cmdUpdate(connName, flags) {
   assertWritable(connName, flags);
   const schema = flags.schema || DEFAULT_SCHEMA;
-  const table = flags.table || fail('--table obrigatório');
+  const table = flags.table || fail('--table required');
   const pk = flags.pk || 'Id';
-  const where = flags.where || fail('--where obrigatório (evita UPDATE sem filtro)');
-  const setObj = JSON.parse(flags.set || fail('--set \'{"col":valor}\' obrigatório'));
+  const where = flags.where || fail('--where required (prevents UPDATE without a filter)');
+  const setObj = JSON.parse(flags.set || fail('--set \'{"col":value}\' required'));
 
   const pool = await getPool(connName);
   const tx = new sql.Transaction(pool);
   try {
     await tx.begin();
-    // 1) snapshot das linhas afetadas (estado anterior)
+    // 1) snapshot of the affected rows (prior state)
     const snap = await new sql.Request(tx).query(`SELECT * FROM ${qual(schema, table)} WHERE ${where}`);
     const before = snap.recordset;
 
     if (before.length === 0) {
       await tx.rollback();
-      console.log('Nenhuma linha corresponde ao filtro. Nada a fazer.');
+      console.log('No row matches the filter. Nothing to do.');
       await pool.close();
       return;
     }
     if (before.some(r => r[pk] === undefined)) {
       await tx.rollback();
-      fail(`A PK "${pk}" não existe no resultado. Informe --pk correto (necessário para o revert).`);
+      fail(`The PK "${pk}" is not in the result. Pass the correct --pk (required for revert).`);
     }
 
-    // 2) monta SET
+    // 2) build SET
     const setReq = new sql.Request(tx);
     const setNames = bindParams(setReq, setObj, 'set');
     const setClause = Object.keys(setObj).map(k => `[${k}] = @${setNames[k]}`).join(', ');
@@ -654,10 +655,10 @@ async function cmdUpdate(connName, flags) {
 
     if (!flags.yes) {
       await tx.rollback();
-      console.log('[DRY-RUN] (sem --yes não aplica)');
+      console.log('[DRY-RUN] (no --yes, not applied)');
       console.log('SQL>  ' + updSql);
-      console.log(`Linhas que seriam alteradas: ${before.length}`);
-      console.log('Colunas alteradas: ' + Object.keys(setObj).join(', '));
+      console.log(`Rows that would change: ${before.length}`);
+      console.log('Changed columns: ' + Object.keys(setObj).join(', '));
       printRows(before, { ...flags, top: 20 });
       await pool.close();
       return;
@@ -665,7 +666,7 @@ async function cmdUpdate(connName, flags) {
 
     const upd = await setReq.query(updSql);
 
-    // 3) journal (undo = restaurar valores anteriores por PK)
+    // 3) journal (undo = restore prior values by PK)
     const entry = {
       seq: nextSeq(),
       id: `u${Date.now()}`,
@@ -683,10 +684,10 @@ async function cmdUpdate(connName, flags) {
     };
     writeJournalEntry(entry);
     await tx.commit();
-    console.log(`OK update: ${entry.affected} linha(s) alterada(s). journal #${entry.seq}. revert: node index.js revert ${entry.seq}`);
+    console.log(`OK update: ${entry.affected} row(s) changed. journal #${entry.seq}. revert: node index.js revert ${entry.seq}`);
   } catch (e) {
     try { await tx.rollback(); } catch (_) {}
-    fail('update falhou: ' + e.message);
+    fail('update failed: ' + e.message);
   } finally {
     await pool.close();
   }
@@ -695,9 +696,9 @@ async function cmdUpdate(connName, flags) {
 async function cmdDelete(connName, flags) {
   assertWritable(connName, flags);
   const schema = flags.schema || DEFAULT_SCHEMA;
-  const table = flags.table || fail('--table obrigatório');
+  const table = flags.table || fail('--table required');
   const pk = flags.pk || 'Id';
-  const where = flags.where || fail('--where obrigatório (evita DELETE sem filtro)');
+  const where = flags.where || fail('--where required (prevents DELETE without a filter)');
 
   const pool = await getPool(connName);
   const tx = new sql.Transaction(pool);
@@ -707,7 +708,7 @@ async function cmdDelete(connName, flags) {
     const before = snap.recordset;
     if (before.length === 0) {
       await tx.rollback();
-      console.log('Nenhuma linha corresponde ao filtro. Nada a fazer.');
+      console.log('No row matches the filter. Nothing to do.');
       await pool.close();
       return;
     }
@@ -715,9 +716,9 @@ async function cmdDelete(connName, flags) {
     const delSql = `DELETE FROM ${qual(schema, table)} WHERE ${where}`;
     if (!flags.yes) {
       await tx.rollback();
-      console.log('[DRY-RUN] (sem --yes não aplica)');
+      console.log('[DRY-RUN] (no --yes, not applied)');
       console.log('SQL>  ' + delSql);
-      console.log(`Linhas que seriam removidas: ${before.length}`);
+      console.log(`Rows that would be removed: ${before.length}`);
       printRows(before, { ...flags, top: 20 });
       await pool.close();
       return;
@@ -740,10 +741,10 @@ async function cmdDelete(connName, flags) {
     };
     writeJournalEntry(entry);
     await tx.commit();
-    console.log(`OK delete: ${entry.affected} linha(s) removida(s). journal #${entry.seq}. revert: node index.js revert ${entry.seq}`);
+    console.log(`OK delete: ${entry.affected} row(s) removed. journal #${entry.seq}. revert: node index.js revert ${entry.seq}`);
   } catch (e) {
     try { await tx.rollback(); } catch (_) {}
-    fail('delete falhou: ' + e.message);
+    fail('delete failed: ' + e.message);
   } finally {
     await pool.close();
   }
@@ -752,9 +753,9 @@ async function cmdDelete(connName, flags) {
 async function cmdInsert(connName, flags) {
   assertWritable(connName, flags);
   const schema = flags.schema || DEFAULT_SCHEMA;
-  const table = flags.table || fail('--table obrigatório');
+  const table = flags.table || fail('--table required');
   const pk = flags.pk || 'Id';
-  const values = JSON.parse(flags.values || fail('--values \'{"col":valor}\' obrigatório'));
+  const values = JSON.parse(flags.values || fail('--values \'{"col":value}\' required'));
 
   const pool = await getPool(connName);
   const tx = new sql.Transaction(pool);
@@ -764,15 +765,15 @@ async function cmdInsert(connName, flags) {
     const names = bindParams(req, values, 'v');
     const colList = Object.keys(values).map(k => `[${k}]`).join(', ');
     const valList = Object.keys(values).map(k => `@${names[k]}`).join(', ');
-    // OUTPUT ... INTO @tbl (em vez de OUTPUT direto) p/ funcionar em tabelas com triggers
-    // (SQL Server proíbe OUTPUT sem INTO quando há trigger habilitada).
+    // OUTPUT ... INTO @tbl (instead of a direct OUTPUT) to work on tables with triggers
+    // (SQL Server forbids OUTPUT without INTO when a trigger is enabled).
     const insSql = `DECLARE @ids TABLE ([pk] sql_variant); INSERT INTO ${qual(schema, table)} (${colList}) OUTPUT INSERTED.[${pk}] INTO @ids ([pk]) VALUES (${valList}); SELECT [pk] AS pk FROM @ids;`;
 
     if (!flags.yes) {
       await tx.rollback();
-      console.log('[DRY-RUN] (sem --yes não aplica)');
+      console.log('[DRY-RUN] (no --yes, not applied)');
       console.log('SQL>  ' + insSql);
-      console.log('Valores: ' + JSON.stringify(values));
+      console.log('Values: ' + JSON.stringify(values));
       await pool.close();
       return;
     }
@@ -798,13 +799,13 @@ async function cmdInsert(connName, flags) {
     console.log(`OK insert: PK(s) ${insertedPks.join(', ')}. journal #${entry.seq}. revert: node index.js revert ${entry.seq}`);
   } catch (e) {
     try { await tx.rollback(); } catch (_) {}
-    fail('insert falhou: ' + e.message);
+    fail('insert failed: ' + e.message);
   } finally {
     await pool.close();
   }
 }
 
-// Divide um script em batches por linhas contendo apenas GO (separador estilo sqlcmd).
+// Splits a script into batches on lines containing only GO (sqlcmd-style separator).
 function splitDdlBatches(text) {
   return text.split(/^\s*GO\s*;?\s*$/im).map(s => s.trim()).filter(Boolean);
 }
@@ -815,20 +816,20 @@ async function cmdDdl(connName, stmtText, flags) {
   let text = stmtText;
   if (flags.file) {
     try { text = fs.readFileSync(flags.file, 'utf8'); }
-    catch (e) { fail('Não consegui ler --file: ' + e.message); }
+    catch (e) { fail('Could not read --file: ' + e.message); }
   }
   if (!text || !text.trim()) {
-    fail('Informe o DDL: ddl <conn> "CREATE TABLE ..." ou --file <arquivo.sql>');
+    fail('Provide the DDL: ddl <conn> "CREATE TABLE ..." or --file <file.sql>');
   }
 
   const batches = splitDdlBatches(text);
-  if (batches.length === 0) fail('Nenhum statement encontrado.');
+  if (batches.length === 0) fail('No statement found.');
 
   if (!flags.yes) {
-    console.log('[DRY-RUN] (sem --yes não aplica)');
-    console.log(`Conexão: ${connName} (${getConn(connName).database})  |  batches: ${batches.length}`);
+    console.log('[DRY-RUN] (no --yes, not applied)');
+    console.log(`Connection: ${connName} (${getConn(connName).database})  |  batches: ${batches.length}`);
     batches.forEach((b, i) => console.log(`--- batch ${i + 1} ---\n${b}`));
-    console.log('⚠️  DDL NÃO é revertível pelo journal. Confira antes de rodar com --yes.');
+    console.log('⚠️  DDL is NOT revertible by the journal. Review before running with --yes.');
     return;
   }
 
@@ -858,10 +859,10 @@ async function cmdDdl(connName, stmtText, flags) {
     };
     writeJournalEntry(entry);
     if (useTx) await tx.commit();
-    console.log(`OK ddl: ${ran} batch(es) executado(s)${useTx ? ' (em transação)' : ' (--no-tx)'}. journal #${entry.seq} (op=ddl, não auto-revertível).`);
+    console.log(`OK ddl: ${ran} batch(es) executed${useTx ? ' (in a transaction)' : ' (--no-tx)'}. journal #${entry.seq} (op=ddl, not auto-revertible).`);
   } catch (e) {
     if (useTx) { try { await tx.rollback(); } catch (_) {} }
-    fail(`ddl falhou no batch ${ran + 1}/${batches.length}: ${e.message}`);
+    fail(`ddl failed on batch ${ran + 1}/${batches.length}: ${e.message}`);
   } finally {
     await pool.close();
   }
@@ -871,10 +872,10 @@ function cmdLog(flags) {
   const rows = db().prepare(
     `SELECT seq, ts, op, connection, schema, "table" AS tbl, affected, where_clause, reverted
      FROM journal ${flags.all ? '' : 'WHERE reverted=0'} ORDER BY seq`).all();
-  if (rows.length === 0) { console.log('(journal vazio)'); return; }
+  if (rows.length === 0) { console.log('(journal empty)'); return; }
   for (const e of rows) {
     const rev = e.reverted ? ' [REVERTED]' : '';
-    console.log(`#${String(e.seq).padStart(4)} ${e.ts}  ${String(e.op).toUpperCase().padEnd(6)} ${e.connection}:${e.schema}.${e.tbl}  afetadas=${e.affected}${rev}`);
+    console.log(`#${String(e.seq).padStart(4)} ${e.ts}  ${String(e.op).toUpperCase().padEnd(6)} ${e.connection}:${e.schema}.${e.tbl}  affected=${e.affected}${rev}`);
     if (e.where_clause) console.log(`        where: ${e.where_clause}`);
   }
 }
@@ -882,7 +883,7 @@ function cmdLog(flags) {
 function cmdShow(id, flags) {
   const e = findEntry(id);
   if (flags.full) { console.log(JSON.stringify(e, null, 2)); return; }
-  const undoSize = e.undo.rows ? `${e.undo.rows.length} linha(s) snapshot`
+  const undoSize = e.undo.rows ? `${e.undo.rows.length} row(s) snapshot`
     : e.undo.pks ? `${e.undo.pks.length} pk(s)` : '-';
   console.log(JSON.stringify({
     seq: e.seq, id: e.id, timestamp: e.timestamp, connection: e.connection, database: e.database,
@@ -890,17 +891,17 @@ function cmdShow(id, flags) {
     where: e.where, set: e.set, values: e.values,
     undo: `${e.undo.kind} (${undoSize})`, reverted: e.reverted, revertedAt: e.revertedAt
   }, null, 2));
-  console.log(`(use 'show ${e.seq} --full' para ver o snapshot completo)`);
+  console.log(`(use 'show ${e.seq} --full' to see the full snapshot)`);
 }
 
 function cmdCacheClear() {
   const r = db().prepare('DELETE FROM result_cache').run();
-  console.log(`result_cache limpo (${r.changes} entrada(s)).`);
+  console.log(`result_cache cleared (${r.changes} entries).`);
 }
 
 async function cmdRevert(id, flags) {
   const entry = findEntry(id);
-  if (entry.reverted) fail(`Entrada #${entry.seq} já foi revertida.`);
+  if (entry.reverted) fail(`Entry #${entry.seq} was already reverted.`);
   assertWritable(entry.connection, flags);
 
   const pool = await getPool(entry.connection);
@@ -910,7 +911,7 @@ async function cmdRevert(id, flags) {
     const { schema, table, pk } = entry;
 
     if (entry.undo.kind === 'restore') {
-      // UPDATE: restaura cada linha pelos valores anteriores
+      // UPDATE: restore each row to its prior values
       for (const row of entry.undo.rows) {
         const req = new sql.Request(tx);
         const cols = Object.keys(row).filter(c => c !== pk);
@@ -919,10 +920,10 @@ async function cmdRevert(id, flags) {
         const setClause = cols.map(c => `[${c}] = @${names[c]}`).join(', ');
         await req.query(`UPDATE ${qual(schema, table)} SET ${setClause} WHERE [${pk}] = @pkval`);
       }
-      console.log(`Revert update: ${entry.undo.rows.length} linha(s) restaurada(s).`);
+      console.log(`Revert update: ${entry.undo.rows.length} row(s) restored.`);
     } else if (entry.undo.kind === 'reinsert') {
-      // DELETE: reinsere as linhas removidas (com IDENTITY_INSERT se necessário).
-      // Identidade: usa schema_cache se disponível, senão consulta ao vivo.
+      // DELETE: reinsert the removed rows (with IDENTITY_INSERT when needed).
+      // Identity: use schema_cache if available, otherwise query live.
       const meta = await getTableMeta(pool, entry.connection, schema, table, false).catch(() => null);
       let identity = meta ? !!(meta.find(c => c.name === pk) || {}).identity : null;
       if (identity === null) {
@@ -940,19 +941,19 @@ async function cmdRevert(id, flags) {
         await req.query(`INSERT INTO ${qual(schema, table)} (${colList}) VALUES (${valList})`);
       }
       if (identity) await new sql.Request(tx).query(`SET IDENTITY_INSERT ${qual(schema, table)} OFF`);
-      console.log(`Revert delete: ${entry.undo.rows.length} linha(s) reinserida(s).`);
+      console.log(`Revert delete: ${entry.undo.rows.length} row(s) reinserted.`);
     } else if (entry.undo.kind === 'delete-pks') {
-      // INSERT: remove as PKs inseridas
+      // INSERT: remove the inserted PKs
       const req = new sql.Request(tx);
       const list = entry.undo.pks.map((p, i) => { req.input('p' + i, p); return '@p' + i; }).join(', ');
       const r = await req.query(`DELETE FROM ${qual(schema, table)} WHERE [${pk}] IN (${list})`);
-      console.log(`Revert insert: ${r.rowsAffected[0]} linha(s) removida(s).`);
+      console.log(`Revert insert: ${r.rowsAffected[0]} row(s) removed.`);
     } else if (entry.undo.kind === 'none') {
       await tx.rollback();
-      fail(`Entrada #${entry.seq} é DDL (op=ddl) e não é revertível automaticamente. Desfaça manualmente com outro 'ddl'.`);
+      fail(`Entry #${entry.seq} is DDL (op=ddl) and is not auto-revertible. Undo it manually with another 'ddl'.`);
     } else {
       await tx.rollback();
-      fail('Tipo de undo desconhecido: ' + entry.undo.kind);
+      fail('Unknown undo kind: ' + entry.undo.kind);
     }
 
     await tx.commit();
@@ -960,7 +961,7 @@ async function cmdRevert(id, flags) {
     console.log(`OK revert #${entry.seq}.`);
   } catch (e) {
     try { await tx.rollback(); } catch (_) {}
-    fail('revert falhou: ' + e.message);
+    fail('revert failed: ' + e.message);
   } finally {
     await pool.close();
   }
@@ -968,7 +969,7 @@ async function cmdRevert(id, flags) {
 
 async function cmdRevertLast(flags) {
   const row = db().prepare('SELECT seq FROM journal WHERE reverted=0 ORDER BY seq DESC LIMIT 1').get();
-  if (!row) fail('Nenhuma mutação pendente para reverter.');
+  if (!row) fail('No pending mutation to revert.');
   await cmdRevert(row.seq, flags);
 }
 
@@ -996,7 +997,7 @@ async function main() {
     case 'cache-clear': return cmdCacheClear();
     default:
       console.log(fs.readFileSync(__filename, 'utf8').split('*/')[0].replace('#!/usr/bin/env node', '').trim());
-      if (cmd) fail('Comando desconhecido: ' + cmd);
+      if (cmd) fail('Unknown command: ' + cmd);
   }
 }
 
