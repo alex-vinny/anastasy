@@ -1,0 +1,31 @@
+{
+  "name": "anastasy",
+  "version": "1.1.0",
+  "author": "alex-vinny",
+  "description": "Reversible SQL Server CLI — SELECT/INSERT/UPDATE/DELETE with a git-like undo journal; every mutation is revertible.",
+  "repository": { "type": "git", "url": "git+https://github.com/alex-vinny/anastasy.git" },
+  "homepage": "https://github.com/alex-vinny/anastasy#readme",
+  "bugs": "https://github.com/alex-vinny/anastasy/issues",
+  "bin": {
+    "dbq": "index.js"
+  },
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "mssql": "11.0.1"
+  },
+  "license": "MIT",
+  "keywords": [
+    "sql-server",
+    "mssql",
+    "cli",
+    "undo",
+    "reversible",
+    "database"
+  ]
+}
