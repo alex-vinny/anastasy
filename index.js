@@ -18,8 +18,9 @@
  *   select   <conn> --table T [--schema sch] [--where "..."] [--top N] [--columns "a,b"]
  *   count    <conn> --table T [--where "..."]        Just the count (cheap in tokens)
  *   describe <conn> <table> [--schema sch] [--refresh]   Columns/types (uses schema_cache)
- *   auth     <conn> [--password <pwd>] [--ttl <min>] [--clear]
+ *   auth     <conn> [--password <pwd>] [--ttl <min>] [--clear] [--device]
  *                                          Cache a session password (connections without Password= in .env)
+ *                                          or sign in with Azure AD (Authentication=Active Directory ... in .env)
  *   insert   <conn> --table T [--schema sch] --values '{json}' [--pk Id]
  *   update   <conn> --table T [--schema sch] --set '{json}' --where "..." [--pk Id]
  *   delete   <conn> --table T [--schema sch] --where "..." [--pk Id]
@@ -44,6 +45,9 @@
  *   - A connection WITHOUT Password= in .env uses a session password: resolved via the
  *     DBQ_PASSWORD env var, the 'auth' cache (with a TTL) or an interactive prompt.
  *     It never lives in a config file.
+ *   - Authentication=Active Directory Interactive|Device Code|Default uses your own Azure AD
+ *     user (MFA in the browser, once per device). Token cached in dbq.sqlite; DBQ_TOKEN env
+ *     var overrides it (e.g. from `az account get-access-token --resource https://database.windows.net/`).
  */
 
 // node:sqlite is experimental — silence only that warning (it pollutes stdout/tokens).
@@ -167,12 +171,15 @@ function parseConnString(cs) {
     database: map['initial catalog'] || map['database'],
     user: map['user id'] || map['uid'] || map['user'],
     password: map['password'] || map['pwd'],
+    // Authentication=Active Directory Interactive|Device Code|Default → Azure AD (see aad section)
+    authMode: normalizeAuthMode(map['authentication']),
+    tenantId: map['tenant id'] || map['tenantid'] || map['authority id'],
     encrypt: truthy(map['encrypt'], true),
     trustServerCertificate: truthy(map['trustservercertificate'] || map['trust server certificate'], true)
   };
 }
 
-// Reads a .env (KEY=connstring). Optional suffixes <NAME>_READONLY / <NAME>_PROD.
+// Reads a .env (KEY=connstring). Optional suffixes <NAME>_READONLY / <NAME>_PROD / <NAME>_DESC.
 function parseEnv(text) {
   const raw = {};
   for (let line of text.split(/\r?\n/)) {
@@ -187,7 +194,7 @@ function parseEnv(text) {
   }
   const conns = {};
   for (const [key, val] of Object.entries(raw)) {
-    if (/_(READONLY|PROD)$/i.test(key)) continue;
+    if (/_(READONLY|PROD|DESC)$/i.test(key)) continue;
     if (!/data source\s*=|server\s*=/i.test(val)) continue; // connection strings only
     const p = parseConnString(val);
     const isReader = (p.user || '').toLowerCase().includes('reader');
@@ -196,6 +203,7 @@ function parseEnv(text) {
     const prodFlag = raw[key + '_PROD'];
     p.prod = prodFlag !== undefined ? /^(true|1|yes)$/i.test(prodFlag) : looksProd;
     p.readonly = roFlag !== undefined ? /^(true|1|yes)$/i.test(roFlag) : (isReader || p.prod);
+    p.desc = (raw[key + '_DESC'] || '').trim() || undefined;
     conns[key] = p;
   }
   return conns;
@@ -259,24 +267,136 @@ async function resolveSessionPassword(name) {
     : `Connection "${name}" uses a session password and there is no cached credential. Run: dbq auth ${name} --password <pwd> [--ttl <min>]`);
 }
 
+// --- Azure AD / Entra ID (Authentication= in the connection string) -----------
+// Modes (ADO.NET-style values, case-insensitive):
+//   Active Directory Interactive  → browser sign-in with MFA (your own user)
+//   Active Directory Device Code  → prints a URL + code; sign in from any device
+//   Active Directory Default      → DefaultAzureCredential (az login / Azure PowerShell / env / MSI)
+// Interactive/Device Code: the access token (~1h) is cached in the credentials table;
+// the MSAL refresh-token cache (@azure/identity-cache-persistence, OS keychain/DPAPI)
+// plus the stored authentication record renew it silently, so MFA happens once per device.
+// No password is ever stored. `User Id=` is used only as a login hint; `Tenant Id=` is optional.
+const AAD_SCOPE = 'https://database.windows.net/.default';
+const AAD_MODES = {
+  'active directory interactive': 'interactive',
+  'active directory device code': 'devicecode',
+  'active directory default': 'default',
+  'active directory azure cli': 'default'
+};
+
+function normalizeAuthMode(v) {
+  if (!v) return undefined;
+  const k = v.trim().toLowerCase().replace(/\s+/g, ' ');
+  return AAD_MODES[k] || AAD_MODES['active directory ' + k] || ('unsupported:' + v.trim());
+}
+
+let _identity, _persistence;
+function identity() { return _identity || (_identity = require('@azure/identity')); }
+function aadPersistence() {
+  if (_persistence !== undefined) return _persistence;
+  try {
+    const { cachePersistencePlugin } = require('@azure/identity-cache-persistence');
+    identity().useIdentityPlugin(cachePersistencePlugin);
+    _persistence = { enabled: true, name: 'dbq-anastasy' };
+  } catch (e) { _persistence = null; } // plugin missing → login again when the token expires
+  return _persistence;
+}
+
+function buildAadCredential(c, mode, { record, silent } = {}) {
+  const id = identity();
+  const opts = { tenantId: c.tenantId || 'organizations', disableAutomaticAuthentication: !!silent };
+  const persistence = aadPersistence();
+  if (persistence) opts.tokenCachePersistenceOptions = persistence;
+  if (record) opts.authenticationRecord = record;
+  if (mode === 'devicecode') {
+    return new id.DeviceCodeCredential({ ...opts, userPromptCallback: info => console.error(info.message) });
+  }
+  if (c.user) opts.loginHint = c.user;
+  return new id.InteractiveBrowserCredential(opts);
+}
+
+function getCachedAad(name) {
+  const row = db().prepare('SELECT secret, expires_at FROM credentials WHERE connection=?').get(name);
+  if (!row) return null;
+  let data = {};
+  try { data = JSON.parse(Buffer.from(row.secret, 'base64').toString('utf8')); } catch (e) { return null; }
+  if (data.kind !== 'aad') return null;
+  const record = data.record ? identity().deserializeAuthenticationRecord(data.record) : undefined;
+  return { token: data.token, record, account: data.account, expiresAt: row.expires_at, expired: Date.parse(row.expires_at) < Date.now() };
+}
+
+function storeAadToken(name, token, record) {
+  // keep a 2-minute safety margin before the real expiry
+  const expires = new Date(token.expiresOnTimestamp - 120000).toISOString();
+  const payload = {
+    kind: 'aad', token: token.token, account: record && record.username,
+    record: record ? identity().serializeAuthenticationRecord(record) : undefined
+  };
+  db().prepare(`INSERT OR REPLACE INTO credentials(connection,secret,expires_at,created_at)
+                VALUES(?,?,?,?)`).run(name, Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'), expires, nowIso());
+  return expires;
+}
+
+// Explicit sign-in (browser / device code). Always allowed, even without a TTY — `dbq auth` is a deliberate act.
+async function aadLogin(name, c, mode) {
+  const cred = buildAadCredential(c, mode);
+  const record = await cred.authenticate(AAD_SCOPE);
+  const token = await cred.getToken(AAD_SCOPE);
+  const expires = storeAadToken(name, token, record);
+  return { token: token.token, record, expires };
+}
+
+async function resolveAadToken(name, c, mode, { allowPrompt } = {}) {
+  if (process.env.DBQ_TOKEN) return process.env.DBQ_TOKEN; // e.g. az account get-access-token --resource https://database.windows.net/
+  const cached = getCachedAad(name);
+  if (cached && !cached.expired) return cached.token;
+  if (cached && cached.record) {
+    // silent renewal from the persisted MSAL cache — no browser, no MFA
+    try {
+      const t = await buildAadCredential(c, mode, { record: cached.record, silent: true }).getToken(AAD_SCOPE);
+      storeAadToken(name, t, cached.record);
+      return t.token;
+    } catch (e) { /* refresh token gone/expired → interactive below */ }
+  }
+  if (!allowPrompt) {
+    fail(`Azure AD token for "${name}" is ${cached ? 'expired' : 'missing'} and silent renewal is not possible. Run: dbq auth ${name} (opens the browser for MFA; add --device for device-code).`);
+  }
+  return (await aadLogin(name, c, mode)).token;
+}
+
 async function getPool(name, passwordOverride) {
   const c = getConn(name);
-  const password = passwordOverride ?? c.password ?? await resolveSessionPassword(name);
-  const pool = new sql.ConnectionPool({
+  const cfg = {
     server: c.server,
     database: c.database,
-    user: c.user,
-    password,
     options: {
       encrypt: c.encrypt !== false,
       trustServerCertificate: c.trustServerCertificate !== false
     },
     requestTimeout: 120000
-  });
+  };
+  if (c.authMode) {
+    if (c.authMode.startsWith('unsupported:')) {
+      fail(`Connection "${name}": Authentication="${c.authMode.slice(12)}" is not supported. Use: Active Directory Interactive | Active Directory Device Code | Active Directory Default.`);
+    }
+    if (c.authMode === 'default') {
+      cfg.authentication = { type: 'azure-active-directory-default', options: {} };
+    } else {
+      const token = await resolveAadToken(name, c, c.authMode, { allowPrompt: !!process.stdin.isTTY });
+      cfg.authentication = { type: 'azure-active-directory-access-token', options: { token } };
+    }
+  } else {
+    cfg.user = c.user;
+    cfg.password = passwordOverride ?? c.password ?? await resolveSessionPassword(name);
+  }
+  const pool = new sql.ConnectionPool(cfg);
   try {
     await pool.connect();
   } catch (e) {
-    if (!c.password && !passwordOverride && /login failed/i.test(e.message)) {
+    if (c.authMode && /login failed/i.test(e.message)) {
+      fail(`Login failed for "${name}" with Azure AD (${e.message}). Either the token is stale (dbq auth ${name} --clear, then dbq auth ${name}) or your account is not a user in database "${c.database}".`);
+    }
+    if (!c.authMode && !c.password && !passwordOverride && /login failed/i.test(e.message)) {
       fail(`Login failed for "${name}" (${e.message}). The session password may have expired on the server — run: dbq auth ${name} --password <pwd>`);
     }
     throw e;
@@ -499,22 +619,52 @@ async function cmdConns() {
   const conns = loadConnections();
   for (const [name, c] of Object.entries(conns)) {
     const tags = [c.readonly ? 'readonly' : 'WRITE', c.prod ? 'PROD' : 'nonprod'];
-    if (!c.password) {
+    if (c.authMode) {
+      tags.push(`aad:${c.authMode}`);
+      if (c.authMode === 'interactive' || c.authMode === 'devicecode') {
+        const cached = getCachedAad(name);
+        tags.push(!cached ? 'auth: pending (dbq auth)'
+          : cached.expired ? (cached.record ? 'auth: token expired (renews silently)' : 'auth: EXPIRED')
+          : `auth ok until ${cached.expiresAt.slice(11, 16)}Z`);
+      }
+    } else if (!c.password) {
       const cached = getCachedCredential(name);
       tags.push(!cached ? 'auth: pending'
         : cached.expired ? 'auth: EXPIRED'
         : `auth ok until ${cached.expiresAt.slice(11, 16)}Z`);
     }
-    console.log(`${name.padEnd(12)} ${c.server} / ${c.database}  [${tags.join(' ')}]  user=${c.user}`);
+    console.log(`${name.padEnd(12)} ${c.server} / ${c.database}  [${tags.join(' ')}]  user=${c.user || '(azure ad)'}`);
+    if (c.desc) console.log(`${' '.repeat(12)}   ↳ ${c.desc}`);
   }
 }
 
 async function cmdAuth(connName, flags) {
-  if (!connName) fail('usage: auth <conn> [--password <pwd>] [--ttl <min>] [--clear]');
+  if (!connName) fail('usage: auth <conn> [--password <pwd>] [--ttl <min>] [--clear] [--device]');
   const c = getConn(connName);
   if (flags.clear) {
     const r = db().prepare('DELETE FROM credentials WHERE connection=?').run(connName);
     console.log(r.changes ? `Credential for ${connName} removed.` : `No cached credential for ${connName}.`);
+    return;
+  }
+  if (c.authMode) {
+    if (c.authMode.startsWith('unsupported:')) await getPool(connName); // emits the proper error
+    if (c.authMode === 'default') {
+      console.log(`"${connName}" uses Active Directory Default: sign in once with "az login" (or Azure PowerShell). Nothing to cache in dbq.`);
+      const pool = await getPool(connName); await pool.close();
+      console.log('OK auth: connection verified with the current Azure credential.');
+      return;
+    }
+    const mode = flags.device ? 'devicecode' : c.authMode;
+    console.error(mode === 'devicecode'
+      ? `Signing in to ${connName} with a device code...`
+      : `Signing in to ${connName}: a browser window will open for Azure AD (MFA)...`);
+    const { record, expires } = await aadLogin(connName, c, mode);
+    const pool = await getPool(connName); await pool.close(); // validate against the database
+    console.log(`OK auth: signed in as ${record.username} — token for ${connName} cached until ${expires}.`);
+    console.log(aadPersistence()
+      ? 'Renewal after expiry is silent (persisted refresh token); MFA again only when the tenant requires it.'
+      : 'Renewal after expiry opens the browser again (install @azure/identity-cache-persistence for silent renewal).');
+    console.log(`Sign out: dbq auth ${connName} --clear`);
     return;
   }
   if (c.password) {
