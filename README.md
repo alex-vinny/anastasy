@@ -34,7 +34,7 @@ Connections live in **`.env`** (one ADO.NET connection string per line — see
 HML=Data Source=...;Initial Catalog=your_db_hml;User Id=...;Password=...;Encrypt=true;TrustServerCertificate=true
 ```
 
-Optional suffixes `<NAME>_READONLY=true|false` and `<NAME>_PROD=true|false`;
+Optional suffixes `<NAME>_READONLY=true|false`, `<NAME>_PROD=true|false`, and `<NAME>_DESC=<text>` (an explanation shown by `dbq conns`);
 without them, `readonly`/`prod` are inferred (a *reader* user, or a db/server
 whose name contains `prd|prod|pro-`). Readonly connections refuse mutations;
 prod connections require `--force-prod`.
@@ -56,10 +56,42 @@ node index.js auth PRD --password '...' --ttl 60  # non-interactive, TTL in minu
 node index.js auth PRD --clear                  # drop the cached credential early
 ```
 
-`conns` shows the state: `auth: pendente` / `auth ok até HH:MMZ` / `auth: EXPIRADA`.
+`conns` shows the state: `auth: pending` / `auth ok until HH:MMZ` / `auth: EXPIRED`.
 The cache stores the password base64-encoded (obfuscation, not encryption — the
 same exposure level as `.env`, but with automatic expiry and outside a durable
 config file).
+
+### Azure AD / Entra ID — your own user with MFA (no password at all)
+
+Add `Authentication=` to the connection string instead of `Password=`:
+
+```
+DEVAAD=Data Source=...;Initial Catalog=...;Authentication=Active Directory Interactive;User Id=you@company.com;Encrypt=true;TrustServerCertificate=true
+```
+
+| `Authentication=` value | How you sign in |
+|---|---|
+| `Active Directory Interactive` | `dbq auth DEVAAD` opens the browser; complete MFA once per device |
+| `Active Directory Device Code` | `dbq auth DEVAAD` prints a URL + code; sign in from any device (also `--device` on any AAD conn) |
+| `Active Directory Default` | `DefaultAzureCredential`: `az login`, Azure PowerShell, env vars or managed identity — nothing cached in dbq |
+
+`User Id=` is only a **login hint**; `Tenant Id=` is optional (default `organizations`).
+Token resolution order at connect time: `DBQ_TOKEN` env var (e.g. from
+`az account get-access-token --resource https://database.windows.net/`) → cached
+access token in `dbq.sqlite` (≈1 h) → **silent renewal** through the persisted MSAL
+refresh-token cache (`@azure/identity-cache-persistence`, stored in the OS keychain /
+DPAPI) → browser sign-in (only when a TTY is present; otherwise it errors and tells you
+to run `dbq auth`). `dbq auth <conn> --clear` signs out.
+
+The readonly/prod flags and every safety rule below apply exactly the same; you get
+the permissions of your own account in that database, no more.
+
+Nothing account-specific lives in the code: user (login hint), tenant, server and
+database come only from the connection string in `.env` (gitignored, like `dbq.sqlite`).
+
+**Status:** `Active Directory Interactive` is validated end to end against Azure SQL
+Database (sign-in, cached token from a non-TTY shell, silent renewal after expiry).
+`Device Code` and `Default` are implemented on the same code path but less exercised.
 
 ## Commands
 
@@ -70,7 +102,7 @@ config file).
 | `select <conn> --table T [--schema s] [--where "..."] [--top N] [--columns "a,b"]` | structured SELECT |
 | `count <conn> --table T [--where "..."]` | just the count (cheap in tokens) |
 | `describe <conn> <table> [--schema s] [--refresh]` | columns/types (uses `schema_cache`) |
-| `auth <conn> [--password <p>] [--ttl <min>] [--clear]` | cache a session password |
+| `auth <conn> [--password <p>] [--ttl <min>] [--clear] [--device]` | cache a session password, or sign in with Azure AD (browser / device code) |
 | `insert <conn> --table T [--schema s] --values '{json}' [--pk Id]` | insert (records inserted PKs) |
 | `update <conn> --table T [--schema s] --set '{json}' --where "..." [--pk Id]` | update (snapshots prior rows) |
 | `delete <conn> --table T [--schema s] --where "..." [--pk Id]` | delete (snapshots removed rows) |
