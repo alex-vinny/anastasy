@@ -98,6 +98,7 @@ Database (sign-in, cached token from a non-TTY shell, silent renewal after expir
 | Command | What |
 |---|---|
 | `conns` | list configured connections and their flags |
+| `schemas <conn> [--table T]` | list the schemas this database actually has (with `--table`: which schemas hold that table) |
 | `query <conn> "<SELECT ...>"` | read-only SQL (`SELECT`/`WITH`) — `--cache [ttl]` to memoize |
 | `select <conn> --table T [--schema s] [--where "..."] [--top N] [--columns "a,b"]` | structured SELECT |
 | `count <conn> --table T [--where "..."]` | just the count (cheap in tokens) |
@@ -153,8 +154,35 @@ Each mutation runs in a transaction, so the snapshot and the change are atomic.
 
 ## Multi-tenant / schema
 
-`--schema` defaults to `sch`. In multi-tenant databases with schemas `sch1`,
-`sch2`, etc., pass `--schema schN`.
+**A schema here is a tenant.** Which one is correct depends on the connection, the
+environment and the client, so no global default can be right — and on some databases
+the fallback schema does not exist at all (`DEVEL` has `sch1`, `sch2`, `sch3`, `sch8`,
+`sch17`… and no bare `sch`).
+
+Resolution order, in one place (`resolveTarget`):
+
+1. an explicitly qualified table — `--table sch1.Contract` or `describe <conn> sch1.Contract`
+2. `--schema schN`
+3. the connection's own default — `<CONN>_SCHEMA=sch1` in `.env`, the same sidecar
+   shape as the existing `<CONN>_DESC`
+4. `DEFAULT_SCHEMA` (`sch`)
+
+Passing both a qualified table and a conflicting `--schema` is an error, not a
+silent winner.
+
+> A qualified name used to be mangled rather than understood: `--table sch1.Contract`
+> became `[sch].[sch1.Contract]` — a single broken identifier — and SQL Server then
+> complained about the *table*, which sends you looking in the wrong place.
+
+**Stop guessing `schN`.** `schemas` answers it directly:
+
+```bash
+node index.js schemas DEVEL                     # every user schema + table count
+node index.js schemas DEVEL --table Contract    # which tenants have this table
+```
+
+The second form also exposes tenant drift — on `DEVEL`, `Contract` has 15 columns in
+`sch1` but 12 in `sch2` and `sch3`.
 
 ## Examples
 

@@ -103,6 +103,46 @@ function parseArgs(argv) {
   return { positionals, flags };
 }
 
+// Every flag any command reads. parseArgs takes anything after `--`, so a typo used
+// to be swallowed and the command ran as if the flag had not been passed — on a
+// mutation that means `--yes` silently missing, or `--where` quietly not applied.
+// Warns rather than exiting, so existing scripted calls keep working.
+const KNOWN_FLAGS = new Set([
+  'all', 'cache', 'clear', 'columns', 'device', 'file', 'force-prod', 'format', 'full',
+  'no-tx', 'password', 'pk', 'refresh', 'schema', 'set', 'table', 'top', 'ttl', 'values',
+  'where', 'yes',
+]);
+
+/** Pure: the unknown flags, each with a spelling suggestion when one is close. */
+function unknownFlags(flags, known = KNOWN_FLAGS) {
+  return Object.keys(flags || {})
+    .filter((k) => !known.has(k))
+    .map((k) => ({
+      flag: k,
+      suggestion: [...known].find((c) => Math.abs(c.length - k.length) <= 2 && editDistance(k, c) <= 2) || null,
+    }));
+}
+
+function warnUnknownFlags(flags) {
+  for (const { flag, suggestion } of unknownFlags(flags)) {
+    console.error(`warning: unknown flag --${flag}${suggestion ? ` (did you mean --${suggestion}?)` : ''} — it was ignored.`);
+  }
+}
+
+function editDistance(a, b) {
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let diag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diag = tmp;
+    }
+  }
+  return prev[b.length];
+}
+
 // ------------------------------------------------------------- sqlite ----
 let _db;
 function db() {
@@ -194,7 +234,7 @@ function parseEnv(text) {
   }
   const conns = {};
   for (const [key, val] of Object.entries(raw)) {
-    if (/_(READONLY|PROD|DESC)$/i.test(key)) continue;
+    if (/_(READONLY|PROD|DESC|SCHEMA)$/i.test(key)) continue;
     if (!/data source\s*=|server\s*=/i.test(val)) continue; // connection strings only
     const p = parseConnString(val);
     const isReader = (p.user || '').toLowerCase().includes('reader');
@@ -204,6 +244,8 @@ function parseEnv(text) {
     p.prod = prodFlag !== undefined ? /^(true|1|yes)$/i.test(prodFlag) : looksProd;
     p.readonly = roFlag !== undefined ? /^(true|1|yes)$/i.test(roFlag) : (isReader || p.prod);
     p.desc = (raw[key + '_DESC'] || '').trim() || undefined;
+    // A schema here is a TENANT, so the right default is per-connection, not global.
+    p.schema = (raw[key + '_SCHEMA'] || '').trim() || undefined;
     conns[key] = p;
   }
   return conns;
@@ -531,7 +573,84 @@ function cachePut(conn, text, rows, ttl) {
 
 // --------------------------------------------------------------- utils ----
 function fail(msg) { console.error('ERROR: ' + msg); process.exit(1); }
+// Bracket-quote a schema/table pair.
+//
+// This used to take whatever it was handed, so a caller doing the natural thing and
+// passing `--table sch1.Contract` got `[sch].[sch1.Contract]` — one broken identifier
+// rather than a two-part name, and SQL Server then complains about the *table*, which
+// sends you looking in the wrong place. splitTarget() resolves that before we get here.
 function qual(schema, table) { return `[${schema}].[${table}]`; }
+
+// Split a possibly-qualified table name. `sch1.Contract` -> { schema: 'sch1', table: 'Contract' };
+// `[sch1].[Contract]` likewise. An unqualified name keeps the caller's schema.
+// Throws rather than calling fail(): fail() exits the process, which makes the
+// function impossible to unit-test. resolveTarget translates the throw back into
+// the usual CLI error, so behaviour at the command line is unchanged.
+function splitTarget(rawTable, fallbackSchema) {
+  const raw = String(rawTable == null ? '' : rawTable).trim();
+  const bracketed = raw.match(/^\[([^\]]+)\]\.\[([^\]]+)\]$/);
+  if (bracketed) return { schema: bracketed[1], table: bracketed[2], qualified: true };
+  const plain = raw.match(/^([A-Za-z_][\w$#@]*)\.([A-Za-z_][\w$#@]*)$/);
+  if (plain) return { schema: plain[1], table: plain[2], qualified: true };
+  if (raw.split('.').length > 2) {
+    throw new Error(`--table "${raw}" has more than two parts. Pass <schema>.<table>, or use --schema with a bare table name.`);
+  }
+  return { schema: fallbackSchema, table: raw.replace(/^\[|\]$/g, ''), qualified: false };
+}
+
+/**
+ * The one place that decides which schema a command runs against.
+ *
+ * Resolution order: an explicit `<schema>.<table>` › `--schema` › the connection's
+ * own default (`<CONN>_SCHEMA` in .env) › DEFAULT_SCHEMA.
+ *
+ * The global default cannot be made "right": in these databases a schema is a
+ * TENANT, so the correct value depends on the connection, the environment and the
+ * client. That is why the per-connection key exists and why `dbq schemas <conn>`
+ * does — guessing schN until one works is not a workflow.
+ */
+function resolveTarget(connName, flags, { requireTable = true, perConnSchema } = {}) {
+  const explicit = (flags.schema && flags.schema !== true) ? flags.schema : null;
+  const perConn = perConnSchema !== undefined ? perConnSchema : connDefaultSchema(connName);
+  const fallback = explicit || perConn || DEFAULT_SCHEMA;
+  const rawTable = flags.table || (requireTable ? fail('--table required') : '');
+  let t;
+  try { t = splitTarget(rawTable, fallback); }
+  catch (e) { return fail(e.message); }
+  if (t.qualified && explicit && explicit !== t.schema) {
+    fail(`Conflicting schema: --table "${rawTable}" says "${t.schema}" but --schema says "${explicit}". Pass one.`);
+  }
+  return { schema: t.schema, table: t.table, source: t.qualified ? 'table' : (explicit ? '--schema' : (perConn ? '.env' : 'default')) };
+}
+
+// Optional per-connection schema, e.g. `ELHML_SCHEMA=sch1` — the same sidecar shape
+// the file already uses for `<CONN>_DESC`.
+//
+// Reads the raw .env rather than going through loadConnections(): that helper calls
+// fail() (process.exit) when no connection is configured, which a lookup for an
+// optional default has no business triggering.
+function schemaFromEnvText(text, connName) {
+  if (!connName) return null;
+  for (let line of String(text || '').split(/\r?\n/)) {
+    line = line.trim();
+    if (!line || line.startsWith('#')) continue;
+    const idx = line.indexOf('=');
+    if (idx === -1) continue;
+    if (line.slice(0, idx).trim() !== `${connName}_SCHEMA`) continue;
+    let val = line.slice(idx + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
+    return val.trim() || null;
+  }
+  return null;
+}
+
+function connDefaultSchema(connName) {
+  if (!connName) return null;
+  try {
+    if (!fs.existsSync(ENV_PATH)) return null;
+    return schemaFromEnvText(fs.readFileSync(ENV_PATH, 'utf8'), connName);
+  } catch { return null; }
+}
 function nowIso() { return new Date().toISOString(); }
 
 // Binds a JS object's values as named parameters on an mssql request.
@@ -716,8 +835,7 @@ async function cmdQuery(connName, queryText, flags) {
 }
 
 async function cmdSelect(connName, flags) {
-  const schema = flags.schema || DEFAULT_SCHEMA;
-  const table = flags.table || fail('--table required');
+  const { schema, table } = resolveTarget(connName, flags);
   const cols = flags.columns ? flags.columns : '*';
   const top = clampTop(flags.top || DEFAULT_TOP);
   const where = flags.where ? `WHERE ${flags.where}` : '';
@@ -739,8 +857,7 @@ async function cmdSelect(connName, flags) {
 }
 
 async function cmdCount(connName, flags) {
-  const schema = flags.schema || DEFAULT_SCHEMA;
-  const table = flags.table || fail('--table required');
+  const { schema, table } = resolveTarget(connName, flags);
   const where = flags.where ? `WHERE ${flags.where}` : '';
   const q = `SELECT COUNT(*) AS n FROM ${qual(schema, table)} ${where}`.trim();
   const pool = await getPool(connName);
@@ -752,13 +869,67 @@ async function cmdCount(connName, flags) {
   }
 }
 
+/**
+ * `dbq schemas <conn> [--table T]` — which schemas this database actually has.
+ *
+ * A schema in these databases is a tenant, so "which schema?" has no global answer
+ * and the previous workflow was to try `--schema sch1`, `sch2`, … until a command
+ * stopped failing. With `--table`, it answers the more useful question: which
+ * tenants have this table, and how many rows does each hold.
+ */
+async function cmdSchemas(connName, flags) {
+  const table = (flags.table && flags.table !== true) ? String(flags.table).replace(/^.*\./, '') : null;
+  const pool = await getPool(connName);
+  try {
+    const req = pool.request();
+    let q;
+    if (table) {
+      req.input('t', table);
+      q = `SELECT s.name AS [schema], COUNT(c.column_id) AS columns
+           FROM sys.schemas s
+           JOIN sys.tables  t ON t.schema_id = s.schema_id AND t.name = @t
+           LEFT JOIN sys.columns c ON c.object_id = t.object_id
+           GROUP BY s.name ORDER BY s.name`;
+    } else {
+      q = `SELECT s.name AS [schema], COUNT(t.object_id) AS tables
+           FROM sys.schemas s
+           LEFT JOIN sys.tables t ON t.schema_id = s.schema_id
+           WHERE s.name NOT IN ('sys','INFORMATION_SCHEMA','guest','db_owner','db_accessadmin',
+                'db_securityadmin','db_ddladmin','db_backupoperator','db_datareader',
+                'db_datawriter','db_denydatareader','db_denydatawriter')
+           GROUP BY s.name ORDER BY s.name`;
+    }
+    const r = await req.query(q);
+    const rows = r.recordset || [];
+    if (!rows.length) {
+      console.log(table ? `No schema in this database has a table named "${table}".` : 'No user schemas found.');
+      return;
+    }
+    const perConn = connDefaultSchema(connName);
+    console.log(table
+      ? `Schemas holding "${table}" on ${connName}:`
+      : `User schemas on ${connName}:`);
+    for (const row of rows) {
+      const isDefault = row.schema === (perConn || DEFAULT_SCHEMA);
+      const count = table ? `${row.columns} column(s)` : `${row.tables} table(s)`;
+      console.log(`  ${String(row.schema).padEnd(12)} ${count}${isDefault ? '   <- current default' : ''}`);
+    }
+    console.log(`\nDefault in use: ${perConn ? `${perConn} (from ${connName}_SCHEMA in .env)` : `${DEFAULT_SCHEMA} (global fallback)`}.`);
+    if (!perConn) console.log(`Pin one per connection by adding  ${connName}_SCHEMA=<schema>  to .env.`);
+  } finally {
+    await pool.close();
+  }
+}
+
 async function cmdDescribe(connName, table, flags) {
-  const schema = flags.schema || DEFAULT_SCHEMA;
-  const tbl = table || flags.table || fail('usage: describe <conn> <table> [--schema sch]');
+  if (!table && !flags.table) fail('usage: describe <conn> <table> [--schema sch]');
+  const { schema, table: tbl } = resolveTarget(connName, { ...flags, table: table || flags.table });
   const pool = await getPool(connName);
   try {
     const meta = await getTableMeta(pool, connName, schema, tbl, !!flags.refresh);
-    if (!meta) fail(`Table ${schema}.${tbl} not found (check --schema).`);
+    if (!meta) fail(`Table ${schema}.${tbl} not found.\n`
+      + `The schema here is a TENANT, so "${schema}" may simply be the wrong one — `
+      + `list what this database actually has with:  dbq schemas ${connName} --table ${tbl}`);
     console.log(`${schema}.${tbl}  (${meta.length} columns)`);
     for (const c of meta) {
       const len = c.maxlen && c.maxlen > 0 ? `(${c.maxlen})` : (c.maxlen === -1 ? '(max)' : '');
@@ -772,8 +943,7 @@ async function cmdDescribe(connName, table, flags) {
 
 async function cmdUpdate(connName, flags) {
   assertWritable(connName, flags);
-  const schema = flags.schema || DEFAULT_SCHEMA;
-  const table = flags.table || fail('--table required');
+  const { schema, table } = resolveTarget(connName, flags);
   const pk = flags.pk || 'Id';
   const where = flags.where || fail('--where required (prevents UPDATE without a filter)');
   const setObj = JSON.parse(flags.set || fail('--set \'{"col":value}\' required'));
@@ -845,8 +1015,7 @@ async function cmdUpdate(connName, flags) {
 
 async function cmdDelete(connName, flags) {
   assertWritable(connName, flags);
-  const schema = flags.schema || DEFAULT_SCHEMA;
-  const table = flags.table || fail('--table required');
+  const { schema, table } = resolveTarget(connName, flags);
   const pk = flags.pk || 'Id';
   const where = flags.where || fail('--where required (prevents DELETE without a filter)');
 
@@ -902,8 +1071,7 @@ async function cmdDelete(connName, flags) {
 
 async function cmdInsert(connName, flags) {
   assertWritable(connName, flags);
-  const schema = flags.schema || DEFAULT_SCHEMA;
-  const table = flags.table || fail('--table required');
+  const { schema, table } = resolveTarget(connName, flags);
   const pk = flags.pk || 'Id';
   const values = JSON.parse(flags.values || fail('--values \'{"col":value}\' required'));
 
@@ -1129,8 +1297,11 @@ async function main() {
   const cmd = argv[0];
   const { positionals, flags } = parseArgs(argv.slice(1));
 
+  warnUnknownFlags(flags);
+
   switch (cmd) {
     case 'conns': return cmdConns();
+    case 'schemas': return cmdSchemas(positionals[0], flags);
     case 'auth': return cmdAuth(positionals[0], flags);
     case 'query': return cmdQuery(positionals[0], positionals[1], flags);
     case 'select': return cmdSelect(positionals[0], flags);
@@ -1151,4 +1322,17 @@ async function main() {
   }
 }
 
-main().catch(e => fail(e.message));
+// Only run the CLI when invoked as a program. Without this guard, importing the
+// module for a unit test executes main() and the test run becomes a CLI run.
+if (require.main === module) {
+  main().catch(e => fail(e.message));
+}
+
+// Pure helpers, exported for `npm test`. Nothing here touches the network, the
+// database or the journal.
+module.exports = {
+  parseArgs, unknownFlags, editDistance,
+  qual, splitTarget, resolveTarget, schemaFromEnvText,
+  parseConnString, parseEnv, clampTop, ttlFromFlag,
+  DEFAULT_SCHEMA, DEFAULT_TOP, MAX_TOP, KNOWN_FLAGS,
+};
