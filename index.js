@@ -103,30 +103,56 @@ function parseArgs(argv) {
   return { positionals, flags };
 }
 
-// Every flag any command reads. parseArgs takes anything after `--`, so a typo used
-// to be swallowed and the command ran as if the flag had not been passed — on a
-// mutation that means `--yes` silently missing, or `--where` quietly not applied.
-// Warns rather than exiting, so existing scripted calls keep working.
+// Every flag any command reads. parseArgs takes anything after `--`, so a typo is
+// swallowed and the command runs as if the flag had never been passed.
+//
+// Here that is worse than elsewhere, and it FAILS rather than warning: `--yess`
+// means the mutation falls back to a dry-run and the caller believes it wrote;
+// `--wher` means a DELETE loses its filter. The caller is usually an agent, which
+// reads the exit code — a warning plus exit 0 reads as success and the wrong belief
+// propagates. `--no-strict-flags` is the escape hatch.
 const KNOWN_FLAGS = new Set([
   'all', 'cache', 'clear', 'columns', 'device', 'file', 'force-prod', 'format', 'full',
-  'no-tx', 'password', 'pk', 'refresh', 'schema', 'set', 'table', 'top', 'ttl', 'values',
-  'where', 'yes',
+  'no-strict-flags', 'no-tx', 'password', 'pk', 'refresh', 'schema', 'set', 'table',
+  'top', 'ttl', 'values', 'where', 'yes',
 ]);
 
-/** Pure: the unknown flags, each with a spelling suggestion when one is close. */
+/**
+ * Pure: the unknown flags, each with a spelling suggestion when one is close.
+ *
+ * Picks the CLOSEST candidate, not the first within the threshold — taking the first
+ * makes the suggestion depend on set order, and a wrong suggestion is worse than
+ * none when the caller is an agent that will act on it.
+ */
+function closestFlag(name, known = KNOWN_FLAGS) {
+  let best = null;
+  let bestDistance = 3; // more than 2 edits is not a suggestion
+  for (const candidate of known) {
+    const d = editDistance(name, candidate);
+    if (d < bestDistance) { best = candidate; bestDistance = d; }
+  }
+  return best;
+}
+
 function unknownFlags(flags, known = KNOWN_FLAGS) {
   return Object.keys(flags || {})
     .filter((k) => !known.has(k))
-    .map((k) => ({
-      flag: k,
-      suggestion: [...known].find((c) => Math.abs(c.length - k.length) <= 2 && editDistance(k, c) <= 2) || null,
-    }));
+    .map((k) => ({ flag: k, suggestion: closestFlag(k, known) }));
 }
 
-function warnUnknownFlags(flags) {
-  for (const { flag, suggestion } of unknownFlags(flags)) {
-    console.error(`warning: unknown flag --${flag}${suggestion ? ` (did you mean --${suggestion}?)` : ''} — it was ignored.`);
+function checkUnknownFlags(flags) {
+  const unknown = unknownFlags(flags);
+  if (!unknown.length) return;
+  const lines = unknown.map(({ flag, suggestion }) =>
+    `  --${flag}${suggestion ? `   did you mean --${suggestion}?` : '   (no close match)'}`);
+  if (flags['no-strict-flags']) {
+    console.error(`warning: ignoring unknown flag(s):\n${lines.join('\n')}`);
+    return;
   }
+  fail(`Unknown flag(s) — nothing was run:\n${lines.join('\n')}\n`
+    + 'An unknown flag is silently dropped, so the command would have run WITHOUT it '
+    + '(a missing --yes turns a mutation into a dry-run; a missing --where drops a filter). '
+    + 'Fix the spelling, or pass --no-strict-flags to proceed anyway.');
 }
 
 function editDistance(a, b) {
@@ -1297,7 +1323,7 @@ async function main() {
   const cmd = argv[0];
   const { positionals, flags } = parseArgs(argv.slice(1));
 
-  warnUnknownFlags(flags);
+  checkUnknownFlags(flags);
 
   switch (cmd) {
     case 'conns': return cmdConns();
@@ -1331,7 +1357,7 @@ if (require.main === module) {
 // Pure helpers, exported for `npm test`. Nothing here touches the network, the
 // database or the journal.
 module.exports = {
-  parseArgs, unknownFlags, editDistance,
+  parseArgs, unknownFlags, checkUnknownFlags, editDistance,
   qual, splitTarget, resolveTarget, schemaFromEnvText,
   parseConnString, parseEnv, clampTop, ttlFromFlag,
   DEFAULT_SCHEMA, DEFAULT_TOP, MAX_TOP, KNOWN_FLAGS,
