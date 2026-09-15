@@ -198,3 +198,20 @@ test('DEFAULT_SCHEMA is still "sch" — changing it is a contract change', () =>
   // is `dbq schemas <conn>` plus <CONN>_SCHEMA, not a different global guess.
   assert.strictEqual(DEFAULT_SCHEMA, 'sch');
 });
+
+// ── strict flags ─────────────────────────────────────────────────────────────
+test('unknownFlags: catches a typo that would turn a mutation into a dry-run', () => {
+  // --yess is not --yes, so the mutation would have previewed while the caller
+  // believed it wrote. This is why the check fails instead of warning.
+  const out = unknownFlags({ yess: true, table: 'Contract' });
+  assert.deepStrictEqual(out.map((u) => u.flag), ['yess']);
+  assert.strictEqual(out[0].suggestion, 'yes');
+});
+
+test('unknownFlags: --no-strict-flags is itself a known flag', () => {
+  assert.deepStrictEqual(unknownFlags({ 'no-strict-flags': true }), []);
+});
+
+test('unknownFlags: a dropped --where filter is caught too', () => {
+  assert.strictEqual(unknownFlags({ wher: "Id=1" })[0].suggestion, 'where');
+});
