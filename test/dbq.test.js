@@ -215,3 +215,70 @@ test('unknownFlags: --no-strict-flags is itself a known flag', () => {
 test('unknownFlags: a dropped --where filter is caught too', () => {
   assert.strictEqual(unknownFlags({ wher: "Id=1" })[0].suggestion, 'where');
 });
+
+// ── query --stats ────────────────────────────────────────────────────────────
+const { parseStatsMessages, timeoutFromFlag, parseInsertRows } = require('../index.js');
+
+test('parseStatsMessages: sums reads per table and splits compile from execution time', () => {
+  // Shape of the info messages SQL Server (Azure SQL) sends for SET STATISTICS IO, TIME ON.
+  const s = parseStatsMessages([
+    'SQL Server parse and compile time: \n   CPU time = 15 ms, elapsed time = 2514 ms.',
+    "Table 'OrderLine'. Scan count 4, logical reads 174423, physical reads 0, page server reads 0, read-ahead reads 6263, page server read-ahead reads 0, lob logical reads 0.",
+    "Table 'Product'. Scan count 2, logical reads 19, physical reads 0, page server reads 0, read-ahead reads 0, page server read-ahead reads 0, lob logical reads 0.",
+    "Table 'Product'. Scan count 1, logical reads 1, physical reads 2, page server reads 0, read-ahead reads 0, page server read-ahead reads 0, lob logical reads 0.",
+    '\n SQL Server Execution Times:\n   CPU time = 1406 ms,  elapsed time = 8541 ms.',
+  ]);
+  assert.strictEqual(s.tables[0].table, 'OrderLine');
+  assert.strictEqual(s.tables[0].readAhead, 6263, 'read-ahead is not confused with "page server read-ahead"');
+  assert.deepStrictEqual(s.tables[1], { table: 'Product', scans: 3, logical: 20, physical: 2, readAhead: 0 });
+  assert.deepStrictEqual(s.total, { logical: 174443, physical: 2, readAhead: 6263 });
+  assert.deepStrictEqual(s.exec, { cpuMs: 1406, elapsedMs: 8541 });
+  assert.deepStrictEqual(s.compile, { cpuMs: 15, elapsedMs: 2514 });
+});
+
+test('parseStatsMessages: no messages gives zeros, not a crash', () => {
+  const s = parseStatsMessages([]);
+  assert.deepStrictEqual(s.total, { logical: 0, physical: 0, readAhead: 0 });
+  assert.strictEqual(s.tables.length, 0);
+});
+
+test('parseStatsMessages: compile and execution time in ONE message go to their own sections', () => {
+  const s = parseStatsMessages([
+    'SQL Server parse and compile time: \n   CPU time = 3 ms, elapsed time = 7 ms.\n'
+    + ' SQL Server Execution Times:\n   CPU time = 40 ms,  elapsed time = 90 ms.',
+  ]);
+  assert.deepStrictEqual(s.compile, { cpuMs: 3, elapsedMs: 7 });
+  assert.deepStrictEqual(s.exec, { cpuMs: 40, elapsedMs: 90 });
+});
+
+test('timeoutFromFlag: seconds to ms; absent stays undefined', () => {
+  assert.strictEqual(timeoutFromFlag('600'), 600000);
+  assert.strictEqual(timeoutFromFlag('1.5'), 1500);
+  assert.strictEqual(timeoutFromFlag(undefined), undefined);
+});
+
+test('timeoutFromFlag: a bare, zero, negative or non-numeric value is refused, not ignored', () => {
+  for (const v of [true, '0', '-5', 'abc']) {
+    assert.throws(() => timeoutFromFlag(v), /positive number/, String(v));
+  }
+});
+
+// ── insert rows ──────────────────────────────────────────────────────────────
+test('parseInsertRows: one object is one row', () => {
+  const { values, rows } = parseInsertRows('{"Name":"a","Qty":1}');
+  assert.deepStrictEqual(values, { Name: 'a', Qty: 1 });
+  assert.deepStrictEqual(rows, [{ Name: 'a', Qty: 1 }]);
+});
+
+test('parseInsertRows: an array is every row, in order', () => {
+  const { rows } = parseInsertRows('[{"Name":"a"},{"Name":"b"}]');
+  assert.deepStrictEqual(rows.map(r => r.Name), ['a', 'b']);
+});
+
+test('parseInsertRows: refuses an empty array, a row that is not an object, and bad JSON', () => {
+  assert.throws(() => parseInsertRows('[]'), /array is empty/);
+  assert.throws(() => parseInsertRows('[{"Name":"a"}, 3]'), /row 2 must be a non-empty JSON object/);
+  assert.throws(() => parseInsertRows('[{"Name":"a"}, {}]'), /row 2/);
+  assert.throws(() => parseInsertRows('null'), /row 1/);
+  assert.throws(() => parseInsertRows('{"Name":'), /not valid JSON/);
+});
