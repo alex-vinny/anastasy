@@ -99,12 +99,12 @@ Database (sign-in, cached token from a non-TTY shell, silent renewal after expir
 |---|---|
 | `conns` | list configured connections and their flags |
 | `schemas <conn> [--table T]` | list the schemas this database actually has (with `--table`: which schemas hold that table) |
-| `query <conn> "<SELECT ...>"` | read-only SQL (`SELECT`/`WITH`) — `--cache [ttl]` to memoize |
+| `query <conn> "<SELECT ...>"` | read-only SQL (`SELECT`/`WITH`) — `--cache [ttl]` to memoize; `--stats` for reads and server time |
 | `select <conn> --table T [--schema s] [--where "..."] [--top N] [--columns "a,b"]` | structured SELECT |
 | `count <conn> --table T [--where "..."]` | just the count (cheap in tokens) |
 | `describe <conn> <table> [--schema s] [--refresh]` | columns/types (uses `schema_cache`) |
 | `auth <conn> [--password <p>] [--ttl <min>] [--clear] [--device]` | cache a session password, or sign in with Azure AD (browser / device code) |
-| `insert <conn> --table T [--schema s] --values '{json}' [--pk Id]` | insert (records inserted PKs) |
+| `insert <conn> --table T [--schema s] --values '{json}' [--pk Id]` | insert (records inserted PKs). `--values '[{..},{..}]'` or `--values-file rows.json` (JSON array) inserts every row in one transaction and **one** journal entry; `revert` deletes them all |
 | `update <conn> --table T [--schema s] --set '{json}' --where "..." [--pk Id]` | update (snapshots prior rows) |
 | `delete <conn> --table T [--schema s] --where "..." [--pk Id]` | delete (snapshots removed rows) |
 | `ddl <conn> "<CREATE/ALTER/DROP ...>" \| --file <a.sql>` | DDL (dev/hml only) `[--yes] [--no-tx]` |
@@ -128,6 +128,22 @@ Read output is compact by default (tuned for LLM context):
 - On `query`/`select`, `--cache [ttl]` stores the result in `result_cache` (TTL
   in seconds, default 300) — handy for reference/enum tables. Reads without
   `--cache` are never cached.
+- `--timeout <s>` raises the per-request timeout (default **120 s**) for one call.
+
+### Measuring a query (`query --stats`)
+
+`--stats` runs the query with `SET STATISTICS IO, TIME ON` and prints, on **stderr**
+(so `--format json` stays clean), the reads per table and the server time:
+
+```
+-- stats: logical reads 174,446, physical 0, read-ahead 6,263 | server CPU 1,406 ms, elapsed 8,541 ms (compile 2,514 ms) | client 13,685 ms
+--   [dbo].[OrderLine]: logical 174,423, physical 0, read-ahead 6,263, scans 4
+```
+
+**Logical reads** is the number to compare before/after an index: pages touched, the
+same whether they were in memory or not. Elapsed time swings with cache and load.
+Add `OPTION (RECOMPILE)` to the query so a cached plan from before the index does
+not hide it. `--stats` skips `--cache` (a cached answer has no reads).
 
 ## How revert works
 

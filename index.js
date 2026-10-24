@@ -14,7 +14,8 @@
  *
  * Commands:
  *   conns                                  List the configured connections
- *   query    <conn> "<SELECT ...>"         Read-only SQL (SELECT/WITH) [--cache [ttl]]
+ *   query    <conn> "<SELECT ...>"         Read-only SQL (SELECT/WITH) [--cache [ttl]] [--stats]
+ *                                          --stats: logical/physical reads per table + server time (stderr)
  *   select   <conn> --table T [--schema sch] [--where "..."] [--top N] [--columns "a,b"]
  *   count    <conn> --table T [--where "..."]        Just the count (cheap in tokens)
  *   describe <conn> <table> [--schema sch] [--refresh]   Columns/types (uses schema_cache)
@@ -35,6 +36,7 @@
  *   --format table|tsv|jsonl|json|count    (default: table)
  *   --full                                 Do not hide null columns
  *   --top N                                Row limit (default 50, max 500)
+ *   --timeout <s>                          Per-request timeout in seconds (default 120)
  *
  * Safety:
  *   - Mutations require --yes (without it, a dry-run showing the snapshot/effect).
@@ -114,7 +116,7 @@ function parseArgs(argv) {
 const KNOWN_FLAGS = new Set([
   'all', 'cache', 'clear', 'columns', 'device', 'file', 'force-prod', 'format', 'full',
   'no-strict-flags', 'no-tx', 'password', 'pk', 'refresh', 'schema', 'set', 'table',
-  'top', 'ttl', 'values', 'where', 'yes',
+  'stats', 'timeout', 'top', 'ttl', 'values', 'values-file', 'where', 'yes',
 ]);
 
 /**
@@ -432,6 +434,19 @@ async function resolveAadToken(name, c, mode, { allowPrompt } = {}) {
   return (await aadLogin(name, c, mode)).token;
 }
 
+// Per-request timeout. --timeout <seconds> raises it for one call (a full scan measured with --stats can
+// take minutes on a 10-million-row table); the default stays 120 s.
+let REQUEST_TIMEOUT_MS = 120000;
+
+// Throws on a bad value instead of falling back: a silently ignored --timeout leaves the caller
+// believing a long scan has minutes when it still has 120 s.
+function timeoutFromFlag(v) {
+  if (v === undefined) return undefined;
+  const s = Number(v);
+  if (v === true || !Number.isFinite(s) || s <= 0) throw new Error('--timeout <seconds> needs a positive number');
+  return Math.round(s * 1000);
+}
+
 async function getPool(name, passwordOverride) {
   const c = getConn(name);
   const cfg = {
@@ -441,7 +456,7 @@ async function getPool(name, passwordOverride) {
       encrypt: c.encrypt !== false,
       trustServerCertificate: c.trustServerCertificate !== false
     },
-    requestTimeout: 120000
+    requestTimeout: REQUEST_TIMEOUT_MS
   };
   if (c.authMode) {
     if (c.authMode.startsWith('unsupported:')) {
@@ -842,9 +857,54 @@ function ensureSelectOnly(text) {
   }
 }
 
+/**
+ * Sums the messages of SET STATISTICS IO, TIME: reads per table and execution time. Logical reads are
+ * the number a DBA trusts (pages touched, independent of what was in memory); elapsed time varies with
+ * cache and load. Parse/compile time is reported apart from execution time.
+ */
+function parseStatsMessages(messages) {
+  const tables = new Map();
+  const exec = { cpuMs: 0, elapsedMs: 0 };
+  const compile = { cpuMs: 0, elapsedMs: 0 };
+  for (const m of messages) {
+    // A time line belongs to the section header above it ("parse and compile time:" or
+    // "Execution Times:"), which may sit in the same message or in the one before.
+    let section = exec;
+    for (const line of String(m).split(/\r?\n/)) {
+      if (/parse and compile time/i.test(line)) { section = compile; continue; }
+      if (/Execution Times/i.test(line)) { section = exec; continue; }
+      const t = line.match(/Table '([^']+)'\. Scan count (\d+), logical reads (\d+), physical reads (\d+)/);
+      if (t) {
+        const ra = line.match(/(?:^|[ ,])read-ahead reads (\d+)/);
+        const e = tables.get(t[1]) || { table: t[1], scans: 0, logical: 0, physical: 0, readAhead: 0 };
+        e.scans += +t[2]; e.logical += +t[3]; e.physical += +t[4]; e.readAhead += ra ? +ra[1] : 0;
+        tables.set(t[1], e);
+        continue;
+      }
+      const time = line.match(/CPU time = (\d+) ms,\s+elapsed time = (\d+) ms/);
+      if (time) { section.cpuMs += +time[1]; section.elapsedMs += +time[2]; }
+    }
+  }
+  const list = [...tables.values()].sort((a, b) => b.logical - a.logical);
+  const total = list.reduce((s, e) => ({ logical: s.logical + e.logical, physical: s.physical + e.physical, readAhead: s.readAhead + e.readAhead }),
+    { logical: 0, physical: 0, readAhead: 0 });
+  return { tables: list, total, exec, compile };
+}
+
+function printStats(stats, wallMs) {
+  const n = v => v.toLocaleString('en-US');
+  const out = [`-- stats: logical reads ${n(stats.total.logical)}, physical ${n(stats.total.physical)}, read-ahead ${n(stats.total.readAhead)}`
+    + ` | server CPU ${n(stats.exec.cpuMs)} ms, elapsed ${n(stats.exec.elapsedMs)} ms (compile ${n(stats.compile.elapsedMs)} ms) | client ${n(wallMs)} ms`];
+  for (const e of stats.tables) {
+    out.push(`--   ${e.table}: logical ${n(e.logical)}, physical ${n(e.physical)}, read-ahead ${n(e.readAhead)}, scans ${n(e.scans)}`);
+  }
+  console.error(out.join('\n'));
+}
+
 async function cmdQuery(connName, queryText, flags) {
   if (!queryText) fail('Provide the SQL: query <conn> "SELECT ..."');
   ensureSelectOnly(queryText);
+  if (flags.stats) return cmdQueryWithStats(connName, queryText, flags);
   const ttl = ttlFromFlag(flags.cache);
   if (ttl) {
     const hit = cacheGet(connName, queryText);
@@ -855,6 +915,24 @@ async function cmdQuery(connName, queryText, flags) {
     const r = await pool.request().query(queryText);
     if (ttl) cachePut(connName, queryText, r.recordset, ttl);
     printRows(r.recordset, flags);
+  } finally {
+    await pool.close();
+  }
+}
+
+// --stats: no result cache (a cached answer has no reads to report). The SET runs in the same batch, after
+// ensureSelectOnly has checked the caller's SQL, so the guard still sees only what the caller wrote.
+async function cmdQueryWithStats(connName, queryText, flags) {
+  const pool = await getPool(connName);
+  try {
+    const req = pool.request();
+    const messages = [];
+    req.on('info', m => messages.push(m.message));
+    const t0 = Date.now();
+    const r = await req.query(`SET STATISTICS IO, TIME ON;\n${queryText}`);
+    const wallMs = Date.now() - t0;
+    printRows(r.recordset, flags);
+    printStats(parseStatsMessages(messages), wallMs);
   } finally {
     await pool.close();
   }
@@ -1095,35 +1173,63 @@ async function cmdDelete(connName, flags) {
   }
 }
 
+/**
+ * The rows of an insert: one JSON object, or an array of them inserted in ONE transaction and ONE
+ * journal entry (revert deletes them all). Throws on anything that would bind no columns.
+ */
+function parseInsertRows(text) {
+  let values;
+  try { values = JSON.parse(text); } catch (e) { throw new Error(`--values is not valid JSON: ${e.message}`); }
+  const rows = Array.isArray(values) ? values : [values];
+  if (rows.length === 0) throw new Error('--values array is empty');
+  rows.forEach((row, i) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row) || Object.keys(row).length === 0) {
+      throw new Error(`--values row ${i + 1} must be a non-empty JSON object of column: value`);
+    }
+  });
+  return { values, rows };
+}
+
 async function cmdInsert(connName, flags) {
   assertWritable(connName, flags);
   const { schema, table } = resolveTarget(connName, flags);
   const pk = flags.pk || 'Id';
-  const values = JSON.parse(flags.values || fail('--values \'{"col":value}\' required'));
+  // --values-file: a JSON array of many rows does not fit the Windows command line (32 KB).
+  const valuesText = flags['values-file'] ? fs.readFileSync(flags['values-file'], 'utf8') : flags.values;
+  if (!valuesText) fail('--values \'{"col":value}\' (or --values-file <file.json>) required');
+  let values, rows;
+  try { ({ values, rows } = parseInsertRows(valuesText)); } catch (e) { fail(e.message); }
+
+  const insertSql = (row, names) => {
+    const colList = Object.keys(row).map(k => `[${k}]`).join(', ');
+    const valList = Object.keys(row).map(k => `@${names[k]}`).join(', ');
+    // OUTPUT ... INTO @tbl (instead of a direct OUTPUT) to work on tables with triggers
+    // (SQL Server forbids OUTPUT without INTO when a trigger is enabled).
+    return `DECLARE @ids TABLE ([pk] sql_variant); INSERT INTO ${qual(schema, table)} (${colList}) OUTPUT INSERTED.[${pk}] INTO @ids ([pk]) VALUES (${valList}); SELECT [pk] AS pk FROM @ids;`;
+  };
 
   const pool = await getPool(connName);
   const tx = new sql.Transaction(pool);
   try {
     await tx.begin();
-    const req = new sql.Request(tx);
-    const names = bindParams(req, values, 'v');
-    const colList = Object.keys(values).map(k => `[${k}]`).join(', ');
-    const valList = Object.keys(values).map(k => `@${names[k]}`).join(', ');
-    // OUTPUT ... INTO @tbl (instead of a direct OUTPUT) to work on tables with triggers
-    // (SQL Server forbids OUTPUT without INTO when a trigger is enabled).
-    const insSql = `DECLARE @ids TABLE ([pk] sql_variant); INSERT INTO ${qual(schema, table)} (${colList}) OUTPUT INSERTED.[${pk}] INTO @ids ([pk]) VALUES (${valList}); SELECT [pk] AS pk FROM @ids;`;
+    const firstReq = new sql.Request(tx);
+    const insSql = insertSql(rows[0], bindParams(firstReq, rows[0], 'v'));
 
     if (!flags.yes) {
       await tx.rollback();
       console.log('[DRY-RUN] (no --yes, not applied)');
       console.log('SQL>  ' + insSql);
-      console.log('Values: ' + JSON.stringify(values));
+      console.log(rows.length === 1 ? 'Values: ' + JSON.stringify(values) : `Rows: ${rows.length} (first: ${JSON.stringify(rows[0])})`);
       await pool.close();
       return;
     }
 
-    const ins = await req.query(insSql);
-    const insertedPks = ins.recordset.map(r => r.pk);
+    const insertedPks = (await firstReq.query(insSql)).recordset.map(r => r.pk);
+    for (const row of rows.slice(1)) {
+      const req = new sql.Request(tx);
+      const res = await req.query(insertSql(row, bindParams(req, row, 'v')));
+      insertedPks.push(...res.recordset.map(r => r.pk));
+    }
     const entry = {
       seq: nextSeq(),
       id: `i${Date.now()}`,
@@ -1324,6 +1430,7 @@ async function main() {
   const { positionals, flags } = parseArgs(argv.slice(1));
 
   checkUnknownFlags(flags);
+  try { REQUEST_TIMEOUT_MS = timeoutFromFlag(flags.timeout) ?? REQUEST_TIMEOUT_MS; } catch (e) { fail(e.message); }
 
   switch (cmd) {
     case 'conns': return cmdConns();
@@ -1360,5 +1467,6 @@ module.exports = {
   parseArgs, unknownFlags, checkUnknownFlags, editDistance,
   qual, splitTarget, resolveTarget, schemaFromEnvText,
   parseConnString, parseEnv, clampTop, ttlFromFlag,
+  parseStatsMessages, timeoutFromFlag, parseInsertRows,
   DEFAULT_SCHEMA, DEFAULT_TOP, MAX_TOP, KNOWN_FLAGS,
 };
