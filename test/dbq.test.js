@@ -410,7 +410,15 @@ test('execJsonDocument: one array per result set, --top per set, truncation repo
 });
 
 test('exec: every flag it reads is a known flag', () => {
-  for (const f of ['yes', 'file', 'format', 'timeout', 'stats', 'top', 'full']) assert.ok(KNOWN_FLAGS.has(f), f);
+  for (const f of ['yes', 'file', 'format', 'timeout', 'stats', 'top', 'full', 'out']) assert.ok(KNOWN_FLAGS.has(f), f);
+});
+
+test('execJsonDocument uncapped (exec --out): every row, nulls kept, no truncation', () => {
+  const rows = Array.from({ length: 700 }, (_, i) => ({ Id: i, Empty: null }));
+  const doc = execJsonDocument([rows], [700], { top: '2', full: true }, { uncapped: true });
+  assert.strictEqual(doc.resultSets[0].length, 700);
+  assert.deepStrictEqual(doc.resultSets[0][0], { Id: 0, Empty: null });
+  assert.ok(!('truncated' in doc));
 });
 
 // The CLI itself, against fake connections in a temp .env (DBQ_ENV_FILE). Every case below

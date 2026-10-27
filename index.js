@@ -31,7 +31,8 @@
  *   delete   <conn> --table T [--schema sch] --where "..." [--pk Id]
  *   ddl      <conn> "<CREATE/ALTER/DROP ...>" | --file <a.sql>   DDL (dev/hml only) [--yes] [--no-tx]
  *   exec     <conn> "<EXEC proc ... | batch>" | --file <a.sql>  Procedure / arbitrary batch (dev/hml only)
- *                                          [--yes] [--format table|json] [--timeout s] [--stats] [--top N] [--full]
+ *                                          [--yes] [--format table|json] [--timeout s] [--stats] [--top N] [--full] [--out file]
+ *                                          --out writes the whole json document (no --top cap) to a file; stdout gets counts only
  *                                          Prints EVERY result set; json = {"resultSets":[[...],...],"rowsAffected":[...]}
  *   log [--all]                          List the mutation history
  *   show     <id> [--full]                 Detail one entry (compact; --full = snapshot)
@@ -137,7 +138,7 @@ function parseArgs(argv) {
 // propagates. `--no-strict-flags` is the escape hatch.
 const KNOWN_FLAGS = new Set([
   'all', 'cache', 'clear', 'columns', 'device', 'file', 'force-prod', 'format', 'full',
-  'no-strict-flags', 'no-tx', 'password', 'pk', 'refresh', 'schema', 'set', 'table',
+  'no-strict-flags', 'no-tx', 'out', 'password', 'pk', 'refresh', 'schema', 'set', 'table',
   'stats', 'timeout', 'top', 'ttl', 'values', 'values-file', 'where', 'yes',
 ]);
 
@@ -1550,8 +1551,8 @@ const STATS_MESSAGE = /Table '[^']+'\. Scan count|CPU time = \d+ ms|parse and co
  * script can parse it whole. Each result set follows the same --top / --full rules as `query`;
  * a cut result set is listed in `truncated` (only present when something was cut).
  */
-function execJsonDocument(recordsets, rowsAffected, flags) {
-  const cap = clampTop(flags.top || DEFAULT_TOP);
+function execJsonDocument(recordsets, rowsAffected, flags, { uncapped = false } = {}) {
+  const cap = uncapped ? Infinity : clampTop(flags.top || DEFAULT_TOP);
   const truncated = [];
   const resultSets = recordsets.map((rows, i) => {
     const shown = rows.length > cap ? rows.slice(0, cap) : rows;
@@ -1577,8 +1578,9 @@ function execJsonDocument(recordsets, rowsAffected, flags) {
  * stays changed.
  */
 async function cmdExec(connName, sqlText, flags) {
-  if (!connName) fail('usage: exec <conn> "<sql>" | --file <a.sql> [--yes] [--format table|json] [--timeout s] [--stats] [--top N] [--full]');
+  if (!connName) fail('usage: exec <conn> "<sql>" | --file <a.sql> [--yes] [--format table|json] [--timeout s] [--stats] [--top N] [--full] [--out file]');
   assertNonProdWrite(connName, 'exec');
+  if (flags.out === true || flags.out === '') fail('--out needs a file path.');
 
   const fmt = String(flags.format || 'table').toLowerCase();
   if (!EXEC_FORMATS.includes(fmt)) fail(`exec --format must be one of: ${EXEC_FORMATS.join(', ')}`);
@@ -1656,7 +1658,11 @@ async function cmdExec(connName, sqlText, flags) {
   writeJournalEntry(entry);
 
   for (const m of messages) if (!STATS_MESSAGE.test(m)) console.error(`-- message: ${m}`);
-  if (fmt === 'json') {
+  if (flags.out) {
+    // A proof needs every row, the transcript only the counts: the cap protects the reader, not the file.
+    fs.writeFileSync(flags.out, JSON.stringify(execJsonDocument(recordsets, rowsAffected, { ...flags, full: true }, { uncapped: true })));
+    console.log(`wrote ${recordsets.length} result set(s) [${recordsets.map(r => r.length).join(', ')} row(s)] to ${flags.out}`);
+  } else if (fmt === 'json') {
     console.log(JSON.stringify(execJsonDocument(recordsets, rowsAffected, flags)));
   } else if (recordsets.length === 0) {
     console.log('(no result sets)');
@@ -1672,7 +1678,7 @@ async function cmdExec(connName, sqlText, flags) {
   // In json mode stdout carries the document only.
   const summary = `OK exec: ${ran} batch(es), ${recordsets.length} result set(s), rows affected [${rowsAffected.join(', ')}]. `
     + `journal #${entry.seq} (op=exec, not auto-revertible).`;
-  if (fmt === 'json') console.error(summary); else console.log(summary);
+  if (fmt === 'json' && !flags.out) console.error(summary); else console.log(summary);
 }
 
 function cmdLog(flags) {
