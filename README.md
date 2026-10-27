@@ -3,8 +3,9 @@
 Runs `SELECT / INSERT / UPDATE / DELETE` against SQL Server in a structured way
 and keeps a **git-like undo journal**: every mutation records the prior state
 (or the inserted PKs) so it can be **reverted**. Also runs **DDL**
-(`CREATE / ALTER / DROP`), restricted to non-prod write connections — DDL is
-audited in the journal but is **not** auto-revertible (see [Safety](#safety)).
+(`CREATE / ALTER / DROP`) and arbitrary batches / procedure calls (`exec`), both
+restricted to non-prod write connections — audited in the journal but **not**
+auto-revertible (see [Safety](#safety)).
 
 ```
 node index.js <command>
@@ -99,7 +100,7 @@ Database (sign-in, cached token from a non-TTY shell, silent renewal after expir
 |---|---|
 | `conns` | list configured connections and their flags |
 | `schemas <conn> [--table T]` | list the schemas this database actually has (with `--table`: which schemas hold that table) |
-| `query <conn> "<SELECT ...>"` | read-only SQL (`SELECT`/`WITH`) — `--cache [ttl]` to memoize; `--stats` for reads and server time |
+| `query <conn> "<SELECT ...>"` | read-only SQL (`SELECT`/`WITH`, see [the read-only guard](#the-query-read-only-guard)) — `--cache [ttl]` to memoize; `--stats` for reads and server time |
 | `select <conn> --table T [--schema s] [--where "..."] [--top N] [--columns "a,b"]` | structured SELECT |
 | `count <conn> --table T [--where "..."]` | just the count (cheap in tokens) |
 | `describe <conn> <table> [--schema s] [--refresh]` | columns/types (uses `schema_cache`) |
@@ -108,6 +109,7 @@ Database (sign-in, cached token from a non-TTY shell, silent renewal after expir
 | `update <conn> --table T [--schema s] --set '{json}' --where "..." [--pk Id]` | update (snapshots prior rows) |
 | `delete <conn> --table T [--schema s] --where "..." [--pk Id]` | delete (snapshots removed rows) |
 | `ddl <conn> "<CREATE/ALTER/DROP ...>" \| --file <a.sql>` | DDL (dev/hml only) `[--yes] [--no-tx]` |
+| `exec <conn> "<EXEC proc ... \| batch>" \| --file <a.sql>` | procedure call / arbitrary batch (dev/hml only), **every** result set printed — `[--yes] [--format table\|json] [--timeout s] [--stats] [--top N] [--full]`; see [exec](#running-a-procedure-or-batch-exec) |
 | `log [--all]` | list the mutation history |
 | `show <id> [--full]` | detail one entry (`--full` shows the snapshot) |
 | `revert <id>` | undo one mutation |
@@ -145,6 +147,36 @@ same whether they were in memory or not. Elapsed time swings with cache and load
 Add `OPTION (RECOMPILE)` to the query so a cached plan from before the index does
 not hide it. `--stats` skips `--cache` (a cached answer has no reads).
 
+### Running a procedure or batch (`exec`)
+
+`query` refuses procedure calls (see below); `exec` is where they go — a harness proc,
+a batch with its own `BEGIN TRAN ... ROLLBACK`, a script with `GO` separators:
+
+```bash
+node index.js exec DEV1 "DECLARE @f bigint = 270; EXEC tenant1.usp_X @FilterId = @f"            # dry-run
+node index.js exec DEV1 "DECLARE @f bigint = 270; EXEC tenant1.usp_X @FilterId = @f" --yes --format json --timeout 900
+node index.js exec DEV1 --file ./harness.sql --yes --stats
+```
+
+- **Non-prod write connections only**, the same rule as `ddl`: prod is refused with **no**
+  override, read-only connections too.
+- Without `--yes` it is a **dry-run** that prints the batches and connects to nothing.
+- The text runs **as written**: no implicit transaction (a batch's own `BEGIN TRAN ... ROLLBACK`
+  must not be nested in one of ours), batches split on `GO` lines, all on **one session** and
+  sent as raw batches (not through `sp_executesql`) — `#temp` tables, `SET` options and an open
+  transaction carry from one `GO` batch to the next. A transaction still open at the end is
+  reported and rolled back.
+- **Every result set** is printed. `--format table` (default): one block per result set.
+  `--format json`: **one** JSON document on stdout and nothing else
+  (`{"resultSets":[[{...}],[...]],"rowsAffected":[...]}`, plus `"truncated":[{"resultSet":n,"shown":x,"total":y}]`
+  when `--top` cut a result set); the summary line and `PRINT` messages go to stderr.
+  `--top`/`--full` apply per result set as in `query`. Note the difference from
+  `query --format json`, which prints the first result set's array followed by a `(N row(s))` line.
+- `--stats` sums reads and server time over all batches (stderr); `--timeout` as in `query`.
+- Journaled as `op=exec` (the full text, batches run, rows affected, the error if any) —
+  failed runs too, since an earlier batch may already have changed data. **Not revertible**:
+  `revert` refuses it.
+
 ## How revert works
 
 | Operation | What is recorded | Revert |
@@ -153,6 +185,7 @@ not hide it. `--stats` skips `--cache` (a cached answer has no reads).
 | `delete` | full snapshot of the removed rows | `INSERT` them back (with `IDENTITY_INSERT` if the PK is an identity) |
 | `insert` | the inserted PKs (via `OUTPUT INSERTED`) | `DELETE` those PKs |
 | `ddl` | the DDL text only (for audit) | **not auto-revertible** — undo manually with another `ddl` |
+| `exec` | the batch text, batches run, rows affected, error (for audit) | **not auto-revertible** — dbq does not know what the batch changed |
 
 Each mutation runs in a transaction, so the snapshot and the change are atomic.
 
@@ -161,12 +194,47 @@ Each mutation runs in a transaction, so the snapshot and the change are atomic.
 - Mutations require `--yes`. Without it → **dry-run** (shows SQL, count, snapshot).
 - `readonly:true` connections **refuse** any mutation.
 - `prod:true` connections **block** mutations unless `--force-prod` (avoid it).
-- `query` accepts only `SELECT`/`WITH`; raw-SQL mutations are refused so the
-  journal is never bypassed.
+- `query` accepts only reads — see [the read-only guard](#the-query-read-only-guard);
+  raw-SQL mutations are refused so the journal is never bypassed.
 - `ddl` runs only on **non-prod write** connections (dev/hml). It is **blocked
   in prod** (prod DDL goes through the migrations pipeline) and is **not
   revertible** by the journal — only the text is recorded, for audit. Supports
   `--file <a.sql>` (batches split on `GO`) and `--no-tx` for non-transactional DDL.
+- `exec` follows the same rule as `ddl` (non-prod write only, no prod override) and is
+  journaled as `op=exec`, not revertible.
+- `DBQ_ENV_FILE=<path>` reads connections from another `.env` (the test suite uses it with fake
+  connections). Every run announces it on stderr, so a run against an unexpected file shows.
+
+### The `query` read-only guard
+
+`query` runs against production too, so its guard is the whole of "read-only" there. It
+used to look only at the start of the text — a `DECLARE` prefix let `EXEC anything`
+through, a `WITH` prefix skipped the mutation check, `exec sp_help ...; EXEC other` passed
+on its prefix, and `SELECT ... INTO` was never caught.
+
+Now it first blanks out comments (`--`, nested `/* */`), string literals (`'...'` with `''`,
+`N'...'`) and delimited identifiers (`[...]`, `"..."`), then checks **every token of the
+batch**. Accepted:
+
+- `SELECT ...` / `WITH ... SELECT ...`, optionally after scalar `DECLARE @v type = value`
+  and `SET @v = ...` (and `SELECT @v = ...`);
+- **one** read-only system procedure as the **whole** batch: `sp_help` and the system
+  `sp_help*` family (closed list), `sp_columns`, `sp_helptext`,
+  `sp_describe_first_result_set`, `sp_spaceused` (object name only) — unqualified or `sys.`.
+
+Refused anywhere in the batch, with the reason and the command to use instead:
+`EXEC`/`EXECUTE` (anything else), `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DROP`, `TRUNCATE`,
+`ALTER`, `CREATE`, `GRANT`, `REVOKE`, `DENY`, `BACKUP`, `RESTORE`, `DBCC`, `KILL`, `SHUTDOWN`,
+`BULK`, `OPENROWSET`, `OPENQUERY`, `OPENDATASOURCE`, `sp_executesql`, `xp_*`, `SELECT ... INTO`,
+`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVE`, `WAITFOR`, control flow (`IF`, `WHILE`, `GOTO`), cursors,
+table variables, `SET <option>`, `USE`, `NEXT VALUE FOR`, and a batch that does not start with
+`SELECT`/`WITH`/`DECLARE`/`SET` (a procedure name as the first statement runs without `EXEC`).
+An unterminated literal or comment is refused too — the guard fails closed.
+
+The word inside a string, a comment or brackets does not count: `SELECT [Delete] FROM t`
+and `SELECT 'drop' AS x` pass. A column named like a keyword must be written `[Bracketed]`.
+Procedure calls — including the `DECLARE @f ...; EXEC proc` harness pattern that used to slip
+through — go to `exec` on a non-prod connection.
 
 ## Multi-tenant / schema
 
@@ -219,6 +287,9 @@ node index.js delete HML --table Widget --pk Id --where "Id = 999" --yes
 # DDL (dev/hml only; blocked in prod; not revertible)
 node index.js ddl DEV "CREATE TABLE tenant1.Foo(Id bigint IDENTITY PRIMARY KEY, Name varchar(50))" --yes
 node index.js ddl DEV --file ./migration.sql --yes
+
+# procedure / batch (dev/hml only; blocked in prod; not revertible; every result set)
+node index.js exec DEV "EXEC tenant1.usp_Report @Id = 1" --yes --format json
 
 # history / undo
 node index.js log

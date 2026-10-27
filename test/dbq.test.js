@@ -282,3 +282,190 @@ test('parseInsertRows: refuses an empty array, a row that is not an object, and 
   assert.throws(() => parseInsertRows('null'), /row 1/);
   assert.throws(() => parseInsertRows('{"Name":'), /not valid JSON/);
 });
+
+// ── query read-only guard ────────────────────────────────────────────────────
+const {
+  stripSqlNoise, analyzeReadOnlySql, readOnlyRefusal,
+  nonProdWriteRefusal, splitDdlBatches, execJsonDocument, KNOWN_FLAGS,
+} = require('../index.js');
+
+const MUST_PASS = [
+  'SELECT 1 AS ok',
+  'select top 5 * from tenant1.Lead with (nolock) where Id > 10 order by Id',
+  ';WITH c AS (SELECT 1 AS a) SELECT a FROM c',
+  'WITH c AS (SELECT Id FROM tenant1.Lead) SELECT COUNT(*) FROM c OPTION (RECOMPILE)',
+  '(SELECT 1) UNION ALL (SELECT 2)',
+  'DECLARE @f bigint = 1; SELECT @f',
+  "DECLARE @f bigint = 1, @d datetime = '2026-10-26'; SET @f = @f + 1; SELECT @f, @d",
+  'DECLARE @n int; SELECT @n = COUNT(*) FROM tenant1.Lead; SELECT @n',
+  "exec sp_help 'tenant1.Lead'",
+  "EXEC sys.sp_helptext N'tenant1.usp_X';",
+  "execute sp_columns @table_name = 'Lead', @table_owner = 'tenant1'",
+  "EXEC sp_describe_first_result_set @tsql = N'DELETE FROM tenant1.Lead; EXEC tenant1.x'",
+  "EXEC sp_spaceused 'tenant1.Lead'",
+  // forbidden words where they are NOT code
+  "SELECT 'update, delete; EXEC tenant1.x; drop table t' AS txt",
+  "SELECT N'it''s an insert' AS txt",
+  'SELECT 1 -- update everything\n, 2',
+  'SELECT /* delete /* nested exec */ still comment */ 1',
+  'SELECT [Delete], [Update], [exec] FROM tenant1.Weird',
+  'SELECT "Insert" FROM tenant1.Weird',
+  'SELECT @@ROWCOUNT, 0x1F, 1.5e3, .5',
+  "SELECT * FROM OPENJSON(@j) WITH (Id int '$.id')",
+  'SELECT x FROM t ORDER BY x OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY',
+];
+
+const MUST_FAIL = {
+  'DECLARE then EXEC': ['DECLARE @x int = 1; EXEC tenant1.qualquer_proc', /EXEC\/EXECUTE/],
+  'a harness call with named arguments': ["DECLARE @f bigint = 1; EXEC tenant1.usp_Harness_GenRunRollback @Proc='usp_Target', @ClientFilterId=@f", /EXEC\/EXECUTE/],
+  'WITH ... DELETE': ['WITH c AS (SELECT 1 a) DELETE FROM t', /DELETE/],
+  'WITH ... UPDATE': ['WITH c AS (SELECT Id FROM t) UPDATE c SET Id = 1', /UPDATE/],
+  'sp_help then ;EXEC': ["exec sp_help 'x'; EXEC outra_proc", /EXEC\/EXECUTE/],
+  'sp_help then a statement': ["exec sp_help 'x' SELECT 1", /whole batch/],
+  'SELECT INTO': ['SELECT * INTO nova_tabela FROM tenant1.Lead', /INTO/],
+  'SELECT INTO #temp': ['SELECT Id INTO #t FROM tenant1.Lead', /INTO/],
+  'sp_executesql': ["EXEC sp_executesql N'SELECT 1'", /SP_EXECUTESQL/],
+  'sp_executesql after SELECT': ["SELECT 1; sp_executesql N'x'", /SP_EXECUTESQL/],
+  'BEGIN TRAN': ['BEGIN TRAN; SELECT 1; ROLLBACK', /BEGIN/],
+  'COMMIT': ['SELECT 1; COMMIT', /COMMIT/],
+  'WAITFOR': ["DECLARE @h int = 0; WAITFOR DELAY '00:00:03'; SELECT 1", /WAITFOR/],
+  'INSERT after SELECT': ['SELECT 1; INSERT INTO t VALUES (1)', /INSERT/],
+  'MERGE': ['WITH s AS (SELECT 1 a) MERGE t USING s ON 1=0 WHEN NOT MATCHED THEN INSERT VALUES (1);', /MERGE/],
+  'DROP / TRUNCATE / ALTER / CREATE': ['SELECT 1; DROP TABLE t; TRUNCATE TABLE u; ALTER TABLE v ADD c int; CREATE TABLE w (a int)', /DROP[\s\S]*TRUNCATE[\s\S]*ALTER[\s\S]*CREATE/],
+  'GRANT': ['SELECT 1; GRANT SELECT ON t TO u', /GRANT/],
+  'DBCC': ['SELECT 1; DBCC CHECKIDENT', /DBCC/],
+  'KILL': ['SELECT 1; KILL 52', /KILL/],
+  'SHUTDOWN': ['SELECT 1 SHUTDOWN', /SHUTDOWN/],
+  'BACKUP': ["SELECT 1; BACKUP DATABASE d TO DISK='x'", /BACKUP/],
+  'OPENROWSET BULK': ["SELECT * FROM OPENROWSET(BULK 'c:/x', SINGLE_CLOB) a", /BULK|OPENROWSET/],
+  'OPENQUERY': ["SELECT * FROM OPENQUERY(srv, 'DELETE x')", /OPENQUERY/],
+  'xp_cmdshell': ["SELECT 1; EXEC xp_cmdshell 'dir'", /xp_cmdshell/],
+  'EXEC of a string': ["EXEC('DELETE FROM t')", /EXEC\/EXECUTE/],
+  'a procedure with no EXEC as first statement': ['tenant1.usp_Purge @Id = 1', /must start with SELECT/],
+  'table variable': ['DECLARE @t TABLE (Id int); SELECT * FROM @t', /table variables/],
+  'table variable in a list': ['DECLARE @a int, @t AS TABLE (Id int); SELECT 1', /table variables/],
+  'cursor': ['DECLARE c CURSOR FOR SELECT 1', /DECLARE: only scalar|CURSOR/],
+  'SET option': ['SET NOCOUNT ON; SELECT 1', /SET: only SET @variable/],
+  'user proc named like sp_help': ["EXEC dbo.sp_help_purge 'x'", /EXEC\/EXECUTE/],
+  'sp_spaceused @updateusage': ["EXEC sp_spaceused 'tenant1.Lead', @updateusage = 'true'", /updateusage/],
+  'keyword after an empty comment still counts': ['SELECT 1;/**/DELETE FROM t', /DELETE/],
+  'keyword glued to a string': ["SELECT ''DELETE FROM t", /DELETE/],
+  'number glued to a keyword': ['SELECT 1eDELETE FROM t', /glued|DELETE/],
+  'unterminated string': ["SELECT 'abc", /unterminated string/],
+  'unterminated comment': ['SELECT 1 /* DELETE FROM t', /unterminated \/\* comment/],
+  'NEXT VALUE FOR': ['SELECT NEXT VALUE FOR tenant1.Seq', /sequence/],
+  'IF block': ['IF 1=1 SELECT 1', /must start|IF/],
+  'empty': ['   ', /empty/],
+};
+
+for (const sqlText of MUST_PASS) {
+  test(`query guard accepts: ${sqlText.replace(/\s+/g, ' ').slice(0, 70)}`, () => {
+    const r = analyzeReadOnlySql(sqlText);
+    assert.deepStrictEqual(r.problems, [], sqlText);
+    assert.strictEqual(r.ok, true);
+  });
+}
+
+for (const [name, [sqlText, why]] of Object.entries(MUST_FAIL)) {
+  test(`query guard refuses: ${name}`, () => {
+    const r = analyzeReadOnlySql(sqlText);
+    assert.strictEqual(r.ok, false, sqlText);
+    assert.match(r.problems.join('\n'), why);
+  });
+}
+
+test('stripSqlNoise: comments become a space, literals and identifiers become placeholders', () => {
+  assert.strictEqual(stripSqlNoise("SELECT 'a''b' -- x\n, [c]]d], \"e\" /* f */ FROM t"), "SELECT ''  \n, [], []   FROM t");
+});
+
+test('readOnlyRefusal: names every problem and points at the write commands', () => {
+  const msg = readOnlyRefusal('DECLARE @x int = 1; EXEC tenant1.p; DELETE FROM t');
+  assert.match(msg, /EXEC\/EXECUTE/);
+  assert.match(msg, /DELETE/);
+  assert.match(msg, /insert\/update\/delete/);
+  assert.match(msg, /exec <conn>/);
+  assert.strictEqual(readOnlyRefusal('SELECT 1'), null);
+});
+
+// ── exec ─────────────────────────────────────────────────────────────────────
+test('nonProdWriteRefusal: prod is refused with no override, read-only too, dev passes', () => {
+  assert.match(nonProdWriteRefusal({ prod: true, readonly: true, user: 'r' }, 'ELPRD', 'exec'), /PRODUCTION.*no override/);
+  assert.match(nonProdWriteRefusal({ prod: true, readonly: false, user: 'w' }, 'P', 'exec'), /PRODUCTION/);
+  assert.match(nonProdWriteRefusal({ prod: false, readonly: true, user: 'app_reader' }, 'R', 'exec'), /read-only/);
+  assert.match(nonProdWriteRefusal({ prod: true }, 'P', 'DDL'), /migrations pipeline/);
+  assert.strictEqual(nonProdWriteRefusal({ prod: false, readonly: false }, 'DEV1', 'exec'), null);
+});
+
+test('splitDdlBatches: exec splits on GO lines only', () => {
+  assert.deepStrictEqual(splitDdlBatches('EXEC a\nGO\nSELECT 1 AS go_on\ngo;\nSELECT 2'), ['EXEC a', 'SELECT 1 AS go_on', 'SELECT 2']);
+});
+
+test('execJsonDocument: one array per result set, --top per set, truncation reported', () => {
+  const rows = Array.from({ length: 3 }, (_, i) => ({ Id: i, Empty: null }));
+  const doc = execJsonDocument([rows, [], [{ Q: 'x' }]], [0, 3], { top: '2' });
+  assert.deepStrictEqual(doc.resultSets, [[{ Id: 0 }, { Id: 1 }], [], [{ Q: 'x' }]]);
+  assert.deepStrictEqual(doc.rowsAffected, [0, 3]);
+  assert.deepStrictEqual(doc.truncated, [{ resultSet: 1, shown: 2, total: 3 }]);
+  assert.ok(!('truncated' in execJsonDocument([[{ a: 1 }]], [], {})));
+});
+
+test('exec: every flag it reads is a known flag', () => {
+  for (const f of ['yes', 'file', 'format', 'timeout', 'stats', 'top', 'full']) assert.ok(KNOWN_FLAGS.has(f), f);
+});
+
+// The CLI itself, against fake connections in a temp .env (DBQ_ENV_FILE). Every case below
+// must stop BEFORE connecting — the servers do not exist, so a connection attempt would fail
+// with a network error instead of the message asserted.
+const { spawnSync } = require('node:child_process');
+const os = require('node:os');
+const fs = require('node:fs');
+const path = require('node:path');
+
+function runCli(args) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbq-test-'));
+  const envFile = path.join(dir, '.env');
+  fs.writeFileSync(envFile, [
+    'FAKEPRD=Data Source=fake-prd.invalid;Initial Catalog=appprd;User Id=claude_reader;Password=x',
+    'FAKEPRDW=Data Source=fake.invalid;Initial Catalog=d;User Id=w;Password=x',
+    'FAKEPRDW_PROD=true',
+    'FAKEPRDW_READONLY=false',
+    'FAKEDEV=Data Source=fake-dev.invalid;Initial Catalog=appdev;User Id=w;Password=x',
+  ].join('\n'));
+  try {
+    const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'index.js'), ...args],
+      { env: { ...process.env, DBQ_ENV_FILE: envFile }, encoding: 'utf8', timeout: 30000 });
+    return { code: r.status, out: r.stdout, err: r.stderr };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('CLI exec: a production connection is refused, even with --yes', () => {
+  for (const conn of ['FAKEPRD', 'FAKEPRDW']) {
+    const r = runCli(['exec', conn, 'SELECT 1', '--yes']);
+    assert.strictEqual(r.code, 1, conn);
+    assert.match(r.err, /PRODUCTION\. exec is blocked in prod \(no override\)/, conn);
+  }
+});
+
+test('CLI exec: without --yes it is a dry-run that prints the batches and connects to nothing', () => {
+  const r = runCli(['exec', 'FAKEDEV', 'EXEC tenant1.usp_X @a = 1\nGO\nSELECT 2']);
+  assert.strictEqual(r.code, 0, r.err);
+  assert.match(r.out, /\[DRY-RUN\]/);
+  assert.match(r.out, /batches: 2/);
+  assert.match(r.out, /--- batch 1 ---\nEXEC tenant1\.usp_X @a = 1/);
+  assert.match(r.out, /NOT revertible/);
+});
+
+test('CLI exec: an unknown --format is refused before anything runs', () => {
+  const r = runCli(['exec', 'FAKEDEV', 'SELECT 1', '--format', 'tsv']);
+  assert.strictEqual(r.code, 1);
+  assert.match(r.err, /--format must be one of: table, json/);
+});
+
+test('CLI query: DECLARE + EXEC is refused before connecting', () => {
+  const r = runCli(['query', 'FAKEDEV', 'DECLARE @f bigint = 1; EXEC tenant1.usp_Y @F = @f']);
+  assert.strictEqual(r.code, 1);
+  assert.match(r.err, /'query' is read-only/);
+  assert.doesNotMatch(r.err, /fake-dev\.invalid|ENOTFOUND|getaddrinfo/);
+});
