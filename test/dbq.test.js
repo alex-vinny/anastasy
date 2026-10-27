@@ -138,7 +138,7 @@ test('parseEnv: a "reader" user is marked read-only without needing a flag', () 
 });
 
 test('parseEnv: a prod-looking database is treated as prod by default', () => {
-  const conns = parseEnv('P=Data Source=s-prd;Initial Catalog=appprd;User Id=u;Password=p');
+  const conns = parseEnv('P=Data Source=s-prd;Initial Catalog=appdbprd;User Id=u;Password=p');
   assert.strictEqual(conns.P.prod, true);
   // prod implies read-only unless explicitly overridden — the safe default.
   assert.strictEqual(conns.P.readonly, true);
