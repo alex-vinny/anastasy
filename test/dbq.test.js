@@ -119,7 +119,7 @@ test('parseEnv: comments and blank lines are skipped', () => {
 
 // ── parseConnString ──────────────────────────────────────────────────────────
 test('parseConnString: reads the ADO.NET keys case-insensitively', () => {
-  const p = parseConnString('Data Source=srv.database.windows.net;Initial Catalog=appdb;User Id=reader;Password=s3cr3t');
+  const p = parseConnString('Data Source=srv.database.windows.net;Initial Catalog=appdb;User Id=reader;Password=***');
   assert.strictEqual(p.server, 'srv.database.windows.net');
   assert.strictEqual(p.database, 'appdb');
   assert.strictEqual(p.user, 'reader');
@@ -145,7 +145,7 @@ test('parseEnv: a prod-looking database is treated as prod by default', () => {
 });
 
 test('parseEnv: an explicit _READONLY=false overrides the inference', () => {
-  const conns = parseEnv('W=Data Source=s;Initial Catalog=d;User Id=u;Password=p\nW_READONLY=false\nW_PROD=false');
+  const conns = parseEnv('W=Data Source=s;Initial Catalog=d;User Id=u;Password=p;\nW_READONLY=false\nW_PROD=false');
   assert.strictEqual(conns.W.readonly, false);
   assert.strictEqual(conns.W.prod, false);
 });
