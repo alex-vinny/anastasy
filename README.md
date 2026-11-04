@@ -118,6 +118,24 @@ Mutations require `--yes`; without it they **dry-run** and print the SQL, the
 affected count, and the snapshot. `--pk` is required in practice for
 `update`/`delete` so the revert can key by primary key.
 
+`dbq --help`, `dbq <command> --help`, `-h` and `dbq help` print the usage and exit 0
+without running anything. An unknown flag is still refused (exit 1); for flags borrowed
+from other CLIs the refusal names the real spelling (`--json` → `--format json`,
+`--limit` → `--top N`, `--conn` → the connection is the first positional).
+
+### Helper scripts (`scripts/`)
+
+Read-only helpers built on `dbq`, for questions a single query does not answer:
+
+| Script | What |
+|---|---|
+| `pending-migrations.js` | FluentMigrator: `[Migration(n)]` classes at a git ref × the versions recorded in the version table — pending public migrations in the order `MigrateUp` applies them, non-public classes that never run, real duplicate versions vs. the same file committed under paths that differ only in case, and versions recorded by another runner. Reads code with `git ls-tree` + one `git cat-file --batch` (no checkout). |
+
+```bash
+node scripts/pending-migrations.js --conn <CONN> --repo <path-to-clone> \
+  [--ref origin/main] [--path src/Migrations] [--schema <s>] [--table VersionInfo] [--json]
+```
+
 ### Output (token economy)
 
 Read output is compact by default (tuned for LLM context):

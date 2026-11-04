@@ -7,7 +7,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 
 const {
-  parseArgs, unknownFlags, editDistance,
+  parseArgs, unknownFlags, editDistance, wantsHelp, FLAG_HINTS, KNOWN_FLAGS,
   qual, splitTarget, schemaFromEnvText,
   parseConnString, parseEnv, clampTop, ttlFromFlag,
   DEFAULT_SCHEMA, DEFAULT_TOP, MAX_TOP,
@@ -206,6 +206,37 @@ test('unknownFlags: catches a typo that would turn a mutation into a dry-run', (
   const out = unknownFlags({ yess: true, table: 'Contract' });
   assert.deepStrictEqual(out.map((u) => u.flag), ['yess']);
   assert.strictEqual(out[0].suggestion, 'yes');
+});
+
+// ── discoverability ──────────────────────────────────────────────────────────
+test('wantsHelp: --help and -h anywhere, and the help command, ask for usage', () => {
+  assert.strictEqual(wantsHelp(['query', '--help']), true);
+  assert.strictEqual(wantsHelp(['query', 'CONN', '-h']), true);
+  assert.strictEqual(wantsHelp(['--help']), true);
+  assert.strictEqual(wantsHelp(['help']), true);
+});
+
+test('wantsHelp: a normal command line does not', () => {
+  assert.strictEqual(wantsHelp(['query', 'CONN', 'SELECT 1']), false);
+  assert.strictEqual(wantsHelp([]), false);
+});
+
+test('unknownFlags: flags from other CLIs get the real spelling, still refused', () => {
+  const out = unknownFlags({ json: true, conn: 'X', limit: '100' });
+  assert.deepStrictEqual(out.map((u) => u.flag), ['json', 'conn', 'limit']);
+  assert.match(out[0].hint, /--format json/);
+  assert.match(out[1].hint, /first positional/);
+  assert.match(out[2].hint, new RegExp(`--top N \\(default ${DEFAULT_TOP}, max ${MAX_TOP}\\)`));
+});
+
+test('unknownFlags: a plain typo has no hint, only the near miss', () => {
+  const out = unknownFlags({ yess: true });
+  assert.strictEqual(out[0].hint, null);
+  assert.strictEqual(out[0].suggestion, 'yes');
+});
+
+test('FLAG_HINTS: no hint shadows a real flag', () => {
+  for (const k of Object.keys(FLAG_HINTS)) assert.ok(!KNOWN_FLAGS.has(k), k);
 });
 
 test('unknownFlags: --no-strict-flags is itself a known flag', () => {

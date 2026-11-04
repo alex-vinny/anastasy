@@ -136,17 +136,35 @@ function closestFlag(name, known = KNOWN_FLAGS) {
   return best;
 }
 
+// Flags people reach for from other CLIs, with no near miss in KNOWN_FLAGS. Edit distance
+// cannot find these (`--json` is far from `--format`), so the refusal said "(no close match)"
+// and the caller had to guess. The refusal still fails; it just names the real spelling.
+const FLAG_HINTS = {
+  json: 'use --format json',
+  jsonl: 'use --format jsonl',
+  tsv: 'use --format tsv',
+  csv: 'use --format tsv',
+  limit: `use --top N (default ${DEFAULT_TOP}, max ${MAX_TOP})`,
+  rows: `use --top N (default ${DEFAULT_TOP}, max ${MAX_TOP})`,
+  'max-rows': `use --top N (default ${DEFAULT_TOP}, max ${MAX_TOP})`,
+  conn: 'the connection is the first positional: dbq <command> <conn> ... (see dbq conns)',
+  connection: 'the connection is the first positional: dbq <command> <conn> ... (see dbq conns)',
+  db: 'the connection is the first positional: dbq <command> <conn> ... (see dbq conns)',
+};
+
 function unknownFlags(flags, known = KNOWN_FLAGS) {
   return Object.keys(flags || {})
     .filter((k) => !known.has(k))
-    .map((k) => ({ flag: k, suggestion: closestFlag(k, known) }));
+    .map((k) => ({ flag: k, suggestion: closestFlag(k, known), hint: FLAG_HINTS[k] || null }));
 }
 
 function checkUnknownFlags(flags) {
   const unknown = unknownFlags(flags);
   if (!unknown.length) return;
-  const lines = unknown.map(({ flag, suggestion }) =>
-    `  --${flag}${suggestion ? `   did you mean --${suggestion}?` : '   (no close match)'}`);
+  const lines = unknown.map(({ flag, suggestion, hint }) => {
+    if (hint) return `  --${flag}   ${hint}`;
+    return `  --${flag}${suggestion ? `   did you mean --${suggestion}?` : '   (no close match)'}`;
+  });
   if (flags['no-strict-flags']) {
     console.error(`warning: ignoring unknown flag(s):\n${lines.join('\n')}`);
     return;
@@ -154,7 +172,20 @@ function checkUnknownFlags(flags) {
   fail(`Unknown flag(s) — nothing was run:\n${lines.join('\n')}\n`
     + 'An unknown flag is silently dropped, so the command would have run WITHOUT it '
     + '(a missing --yes turns a mutation into a dry-run; a missing --where drops a filter). '
-    + 'Fix the spelling, or pass --no-strict-flags to proceed anyway.');
+    + 'Fix the spelling, or pass --no-strict-flags to proceed anyway. Usage: dbq --help');
+}
+
+// Pure: did the caller ask for usage? `--help` used to hit the strict-flag check and exit 1
+// as an unknown flag, so the one way to discover a flag (e.g. --top) was itself refused.
+// Checked BEFORE parsing: help never runs the command, whatever else is on the line.
+function wantsHelp(argv) {
+  const [cmd, ...rest] = argv || [];
+  if (cmd === 'help' || cmd === '--help' || cmd === '-h') return true;
+  return rest.includes('--help') || rest.includes('-h');
+}
+
+function usageText() {
+  return fs.readFileSync(__filename, 'utf8').split('*/')[0].replace('#!/usr/bin/env node', '').trim();
 }
 
 function editDistance(a, b) {
@@ -1426,6 +1457,7 @@ async function cmdRevertLast(flags) {
 // --------------------------------------------------------------- main ----
 async function main() {
   const argv = process.argv.slice(2);
+  if (wantsHelp(argv)) { console.log(usageText()); return; }
   const cmd = argv[0];
   const { positionals, flags } = parseArgs(argv.slice(1));
 
@@ -1450,7 +1482,7 @@ async function main() {
     case 'revert-last': return cmdRevertLast(flags);
     case 'cache-clear': return cmdCacheClear();
     default:
-      console.log(fs.readFileSync(__filename, 'utf8').split('*/')[0].replace('#!/usr/bin/env node', '').trim());
+      console.log(usageText());
       if (cmd) fail('Unknown command: ' + cmd);
   }
 }
@@ -1464,7 +1496,7 @@ if (require.main === module) {
 // Pure helpers, exported for `npm test`. Nothing here touches the network, the
 // database or the journal.
 module.exports = {
-  parseArgs, unknownFlags, checkUnknownFlags, editDistance,
+  parseArgs, unknownFlags, checkUnknownFlags, editDistance, wantsHelp, FLAG_HINTS,
   qual, splitTarget, resolveTarget, schemaFromEnvText,
   parseConnString, parseEnv, clampTop, ttlFromFlag,
   parseStatsMessages, timeoutFromFlag, parseInsertRows,
