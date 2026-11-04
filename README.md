@@ -99,9 +99,9 @@ Database (sign-in, cached token from a non-TTY shell, silent renewal after expir
 |---|---|
 | `conns` | list configured connections and their flags |
 | `schemas <conn> [--table T]` | list the schemas this database actually has (with `--table`: which schemas hold that table) |
-| `query <conn> "<SELECT ...>"` | read-only SQL (`SELECT`/`WITH`) — `--cache [ttl]` to memoize; `--stats` for reads and server time |
+| `query <conn> "<SELECT ...>" | --file <a.sql>` | read-only SQL (`SELECT`/`WITH`) — `--cache [ttl]` to memoize; `--stats` for reads and server time. `--file` sends a long query (a `VALUES` list, a CTE chain) exactly as written; inline and `--file` together are refused |
 | `select <conn> --table T [--schema s] [--where "..."] [--top N] [--columns "a,b"]` | structured SELECT |
-| `count <conn> --table T [--where "..."]` | just the count (cheap in tokens) |
+| `count <conn> <table> | --table T [--where "..."]` | just the count (cheap in tokens); the table can be positional, like `describe` |
 | `describe <conn> <table> [--schema s] [--refresh]` | columns/types (uses `schema_cache`) |
 | `auth <conn> [--password <p>] [--ttl <min>] [--clear] [--device]` | cache a session password, or sign in with Azure AD (browser / device code) |
 | `insert <conn> --table T [--schema s] --values '{json}' [--pk Id]` | insert (records inserted PKs). `--values '[{..},{..}]'` or `--values-file rows.json` (JSON array) inserts every row in one transaction and **one** journal entry; `revert` deletes them all |

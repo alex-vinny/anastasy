@@ -14,10 +14,10 @@
  *
  * Commands:
  *   conns                                  List the configured connections
- *   query    <conn> "<SELECT ...>"         Read-only SQL (SELECT/WITH) [--cache [ttl]] [--stats]
+ *   query    <conn> "<SELECT ...>" | --file <a.sql>   Read-only SQL (SELECT/WITH) [--cache [ttl]] [--stats]
  *                                          --stats: logical/physical reads per table + server time (stderr)
  *   select   <conn> --table T [--schema sch] [--where "..."] [--top N] [--columns "a,b"]
- *   count    <conn> --table T [--where "..."]        Just the count (cheap in tokens)
+ *   count    <conn> <table> | --table T [--where "..."]   Just the count (cheap in tokens)
  *   describe <conn> <table> [--schema sch] [--refresh]   Columns/types (uses schema_cache)
  *   auth     <conn> [--password <pwd>] [--ttl <min>] [--clear] [--device]
  *                                          Cache a session password (connections without Password= in .env)
@@ -932,8 +932,43 @@ function printStats(stats, wallMs) {
   console.error(out.join('\n'));
 }
 
-async function cmdQuery(connName, queryText, flags) {
-  if (!queryText) fail('Provide the SQL: query <conn> "SELECT ..."');
+/**
+ * The SQL of a command that takes it inline or from `--file`. A long query (a VALUES list,
+ * a CTE chain) does not survive shell quoting, so the file is the only way to send it as written.
+ * Throws instead of failing so the rule is testable; the caller turns it into `fail`.
+ */
+function sqlFromArgs(inline, file, usage, readFile = (f) => fs.readFileSync(f, 'utf8')) {
+  const fromFile = file && file !== true;
+  if (file === true) throw new Error('--file needs a path: ' + usage);
+  if (inline && fromFile) throw new Error('Pass the SQL inline OR --file, not both.');
+  if (fromFile) {
+    let text;
+    try { text = readFile(file); }
+    catch (e) { throw new Error('Could not read --file: ' + e.message); }
+    if (!String(text).trim()) throw new Error('--file is empty: ' + file);
+    return text;
+  }
+  if (!inline) throw new Error('Provide the SQL: ' + usage);
+  return inline;
+}
+
+/**
+ * `count <conn> <table>` reads like `describe <conn> <table>`; `--table` still works.
+ * Both at once must name the same table, or the count would silently pick one.
+ */
+function withPositionalTable(flags, positional) {
+  if (!positional) return flags;
+  const given = flags.table && flags.table !== true ? String(flags.table) : null;
+  if (given && given !== positional) {
+    throw new Error(`Conflicting table: "${positional}" and --table "${given}". Pass one.`);
+  }
+  return { ...flags, table: positional };
+}
+
+async function cmdQuery(connName, inlineSql, flags) {
+  let queryText;
+  try { queryText = sqlFromArgs(inlineSql, flags.file, 'query <conn> "SELECT ..." | --file <a.sql>'); }
+  catch (e) { return fail(e.message); }
   ensureSelectOnly(queryText);
   if (flags.stats) return cmdQueryWithStats(connName, queryText, flags);
   const ttl = ttlFromFlag(flags.cache);
@@ -1470,7 +1505,11 @@ async function main() {
     case 'auth': return cmdAuth(positionals[0], flags);
     case 'query': return cmdQuery(positionals[0], positionals[1], flags);
     case 'select': return cmdSelect(positionals[0], flags);
-    case 'count': return cmdCount(positionals[0], flags);
+    case 'count': {
+      let countFlags;
+      try { countFlags = withPositionalTable(flags, positionals[1]); } catch (e) { return fail(e.message); }
+      return cmdCount(positionals[0], countFlags);
+    }
     case 'describe': return cmdDescribe(positionals[0], positionals[1], flags);
     case 'update': return cmdUpdate(positionals[0], flags);
     case 'delete': return cmdDelete(positionals[0], flags);
@@ -1499,6 +1538,6 @@ module.exports = {
   parseArgs, unknownFlags, checkUnknownFlags, editDistance, wantsHelp, FLAG_HINTS,
   qual, splitTarget, resolveTarget, schemaFromEnvText,
   parseConnString, parseEnv, clampTop, ttlFromFlag,
-  parseStatsMessages, timeoutFromFlag, parseInsertRows,
+  parseStatsMessages, timeoutFromFlag, parseInsertRows, sqlFromArgs, withPositionalTable,
   DEFAULT_SCHEMA, DEFAULT_TOP, MAX_TOP, KNOWN_FLAGS,
 };

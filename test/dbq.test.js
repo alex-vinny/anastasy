@@ -10,7 +10,7 @@ const {
   parseArgs, unknownFlags, editDistance, wantsHelp, FLAG_HINTS, KNOWN_FLAGS,
   qual, splitTarget, schemaFromEnvText,
   parseConnString, parseEnv, clampTop, ttlFromFlag,
-  DEFAULT_SCHEMA, DEFAULT_TOP, MAX_TOP,
+  DEFAULT_SCHEMA, DEFAULT_TOP, MAX_TOP, sqlFromArgs, withPositionalTable,
 } = require('../index.js');
 
 // ── parseArgs ────────────────────────────────────────────────────────────────
@@ -312,4 +312,54 @@ test('parseInsertRows: refuses an empty array, a row that is not an object, and 
   assert.throws(() => parseInsertRows('[{"Name":"a"}, {}]'), /row 2/);
   assert.throws(() => parseInsertRows('null'), /row 1/);
   assert.throws(() => parseInsertRows('{"Name":'), /not valid JSON/);
+});
+
+// ── query --file / count <table> ─────────────────────────────────────────────
+
+const USAGE = 'query <conn> "SELECT ..." | --file <a.sql>';
+
+test('sqlFromArgs: inline SQL passes through', () => {
+  assert.strictEqual(sqlFromArgs('SELECT 1', undefined, USAGE), 'SELECT 1');
+});
+
+test('sqlFromArgs: --file is read as written', () => {
+  const sql = 'SELECT v FROM (VALUES (1),(2)) t(v)';
+  assert.strictEqual(sqlFromArgs(undefined, 'a.sql', USAGE, (f) => (f === 'a.sql' ? sql : '')), sql);
+});
+
+test('sqlFromArgs: inline and --file together are refused', () => {
+  assert.throws(() => sqlFromArgs('SELECT 1', 'a.sql', USAGE, () => 'SELECT 2'), /not both/);
+});
+
+test('sqlFromArgs: neither inline nor --file names the usage', () => {
+  assert.throws(() => sqlFromArgs(undefined, undefined, USAGE), /Provide the SQL: query/);
+});
+
+test('sqlFromArgs: --file without a path is refused, not read as "true"', () => {
+  assert.throws(() => sqlFromArgs(undefined, true, USAGE), /--file needs a path/);
+});
+
+test('sqlFromArgs: an empty file is refused instead of sent', () => {
+  assert.throws(() => sqlFromArgs(undefined, 'a.sql', USAGE, () => ' \t\n '), /--file is empty/);
+});
+
+test('sqlFromArgs: an unreadable file says which read failed', () => {
+  assert.throws(() => sqlFromArgs(undefined, 'x.sql', USAGE, () => { throw new Error('ENOENT'); }), /Could not read --file: ENOENT/);
+});
+
+test('withPositionalTable: positional table becomes --table', () => {
+  assert.deepStrictEqual(withPositionalTable({ where: 'Id > 1' }, 'KanbanCard'), { where: 'Id > 1', table: 'KanbanCard' });
+});
+
+test('withPositionalTable: without a positional the flags are untouched', () => {
+  const flags = { table: 'KanbanCard' };
+  assert.strictEqual(withPositionalTable(flags, undefined), flags);
+});
+
+test('withPositionalTable: the same table twice is fine', () => {
+  assert.strictEqual(withPositionalTable({ table: 'KanbanCard' }, 'KanbanCard').table, 'KanbanCard');
+});
+
+test('withPositionalTable: two different tables are refused', () => {
+  assert.throws(() => withPositionalTable({ table: 'KanbanPipe' }, 'KanbanCard'), /Conflicting table/);
 });
