@@ -174,6 +174,12 @@ not hide it. `--stats` skips `--cache` (a cached answer has no reads).
 
 Each mutation runs in a transaction, so the snapshot and the change are atomic.
 
+**Known limitation: composite primary keys.** The journal key is a single column (`--pk`, default `Id`). On a
+table whose primary key has two or more columns (a link table such as user × unit), `insert` records only the
+column passed in `--pk`, and `revert` deletes **every row** that shares that value, not just the one inserted.
+Seen 2026-11-05. Until composite keys are supported: on such tables, `show <id>` before any `revert`, and undo
+an insert with a `delete` whose `--where` names every key column.
+
 ## Safety
 
 - Mutations require `--yes`. Without it → **dry-run** (shows SQL, count, snapshot).
