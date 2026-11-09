@@ -163,6 +163,28 @@ same whether they were in memory or not. Elapsed time swings with cache and load
 Add `OPTION (RECOMPILE)` to the query so a cached plan from before the index does
 not hide it. `--stats` skips `--cache` (a cached answer has no reads).
 
+### Measuring a procedure (`exec`)
+
+`query` does not run `EXEC`. To read what a procedure returns, or to measure it, use `exec`:
+
+```bash
+dbq exec DEV1 "EXEC tenant1.usp_Report '825', 0, 54222761, '1,2,3', NULL, 0, 0, 0" --stats --format count
+```
+
+- One procedure call per run: no second statement, no dynamic SQL (`sp_executesql`, `EXEC('...')`),
+  no mutation keyword outside the call.
+- It runs inside a transaction that is **always rolled back**, so a procedure that writes to
+  `#temp` tables (or to real ones, by accident) leaves nothing behind. Every result set is printed.
+- If the procedure ends the transaction itself (`COMMIT`/`ROLLBACK` inside it), dbq cannot roll back
+  and the command **fails**, saying its writes are permanent.
+- Refused on PROD connections with write rights (no override). A read-only connection (reader user)
+  is allowed; the server refuses writes there anyway.
+- Before running a procedure that can loop (a `WHILE` over input), check the input: the rollback undoes
+  writes, not the CPU a loop burns on a shared database until `--timeout`.
+
+Per-statement cost of a procedure, after running it: `sys.dm_exec_query_stats` × `sys.dm_exec_sql_text`
+filtered by `objectid = OBJECT_ID('<schema>.<proc>')`, ordered by `last_logical_reads`.
+
 ## How revert works
 
 | Operation | What is recorded | Revert |
@@ -186,7 +208,9 @@ an insert with a `delete` whose `--where` names every key column.
 - `readonly:true` connections **refuse** any mutation.
 - `prod:true` connections **block** mutations unless `--force-prod` (avoid it).
 - `query` accepts only `SELECT`/`WITH`; raw-SQL mutations are refused so the
-  journal is never bypassed.
+  journal is never bypassed. The check ignores string literals, comments and `[identifiers]`, and
+  applies to `WITH` too. Until 2026-11-09 a `WITH ... DELETE` and a `DECLARE ...; EXEC proc` passed it.
+- `exec` runs one procedure call and always rolls back (see *Measuring a procedure*).
 - `ddl` runs only on **non-prod write** connections (dev/hml). It is **blocked
   in prod** (prod DDL goes through the migrations pipeline) and is **not
   revertible** by the journal — only the text is recorded, for audit. Supports

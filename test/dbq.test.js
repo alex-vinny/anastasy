@@ -363,3 +363,55 @@ test('withPositionalTable: the same table twice is fine', () => {
 test('withPositionalTable: two different tables are refused', () => {
   assert.throws(() => withPositionalTable({ table: 'KanbanPipe' }, 'KanbanCard'), /Conflicting table/);
 });
+
+// ── readOnlyProblem / execProblem — the read guard and procedure calls (2026-11-09) ──
+const { readOnlyProblem, execProblem, execConnProblem, sqlCode } = require('../index.js');
+
+test('readOnlyProblem: plain reads pass', () => {
+  assert.strictEqual(readOnlyProblem('SELECT 1'), null);
+  assert.strictEqual(readOnlyProblem('WITH c AS (SELECT 1 x) SELECT * FROM c'), null);
+  assert.strictEqual(readOnlyProblem('exec sp_helptext [tenant1].[Proc]'), null);
+  assert.strictEqual(readOnlyProblem("DECLARE @d date = '2026-01-01'; SELECT @d"), null);
+});
+
+test('readOnlyProblem: a WITH query no longer skips the mutation check', () => {
+  assert.match(readOnlyProblem('WITH c AS (SELECT id FROM t) DELETE FROM t WHERE id IN (SELECT id FROM c)'), /mutation/);
+});
+
+test('readOnlyProblem: DECLARE does not let an EXEC through', () => {
+  assert.match(readOnlyProblem('DECLARE @x int = 1; EXEC tenant1.WritesSomething @x'), /dbq exec/);
+  assert.match(readOnlyProblem('DECLARE @s nvarchar(100) = N\'x\'; EXECUTE sp_executesql @s'), /dbq exec/);
+});
+
+test('readOnlyProblem: keywords inside literals, comments and [identifiers] are not mutations', () => {
+  assert.strictEqual(readOnlyProblem("SELECT [Update], 'delete me' AS t FROM x -- drop later"), null);
+  assert.strictEqual(readOnlyProblem('SELECT LastUpdateUTC FROM x /* insert */'), null);
+});
+
+test('readOnlyProblem: a keyword hidden after a comment is still seen', () => {
+  assert.match(readOnlyProblem('SELECT 1 /* x */ ; DELETE FROM t'), /mutation/);
+});
+
+test('execProblem: one named procedure call passes', () => {
+  assert.strictEqual(execProblem("EXEC tenant1.usp_Report '912', 0, 57410063, '1,2,3', NULL, 0, 0, 0"), null);
+  assert.strictEqual(execProblem('execute [tenant1].[Proc] @a = 1;'), null);
+  assert.strictEqual(execProblem("EXEC tenant1.P 'insert; delete'"), null); // inside a literal
+});
+
+test('execProblem: refuses anything that is not a single procedure call', () => {
+  assert.match(execProblem('SELECT 1'), /one procedure call/);
+  assert.match(execProblem('EXEC tenant1.P; DELETE FROM t'), /single procedure call|mutation/);
+  assert.match(execProblem('EXEC tenant1.P; EXEC tenant1.Q'), /single procedure call/);
+  assert.match(execProblem("EXEC('DELETE FROM t')"), /one procedure call|dynamic SQL/);
+  assert.match(execProblem("EXEC sp_executesql N'DELETE FROM t'"), /dynamic SQL/);
+});
+
+test('execConnProblem: PROD with write rights is refused; reader user and nonprod pass', () => {
+  assert.match(execConnProblem({ prod: true, readonly: false }), /PRODUCTION/);
+  assert.strictEqual(execConnProblem({ prod: true, readonly: true }), null);
+  assert.strictEqual(execConnProblem({ prod: false, readonly: false }), null);
+});
+
+test('sqlCode: blanks literals (with escaped quotes), comments and brackets', () => {
+  assert.strictEqual(sqlCode("SELECT 'it''s update' -- delete\n FROM [Drop]").replace(/\s+/g, ' ').trim(), "select '' from []");
+});

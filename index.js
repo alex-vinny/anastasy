@@ -26,7 +26,10 @@
  *   update   <conn> --table T [--schema sch] --set '{json}' --where "..." [--pk Id]
  *   delete   <conn> --table T [--schema sch] --where "..." [--pk Id]
  *   ddl      <conn> "<CREATE/ALTER/DROP ...>" | --file <a.sql>   DDL (dev/hml only) [--yes] [--no-tx]
- *   log [--all]                            List the mutation history
+ *   exec     <conn> "EXEC schema.Proc ..." | --file <a.sql>   One procedure call in a transaction that is
+ *                                          ALWAYS rolled back; prints every result set [--stats].
+ *                                          Refused on PROD write connections (reader user is fine).
+ *   log [--all]                           List the mutation history
  *   show     <id> [--full]                 Detail one entry (compact; --full = snapshot)
  *   revert   <id>                          Undo one mutation
  *   revert-last                            Undo the most recent non-reverted mutation
@@ -878,14 +881,83 @@ async function cmdAuth(connName, flags) {
   console.log(`Clear before expiry: dbq auth ${connName} --clear`);
 }
 
-function ensureSelectOnly(text) {
-  const t = text.trim().replace(/^\(+/, '').toLowerCase();
+/**
+ * Pure: the SQL with comments, string literals and [bracketed identifiers] blanked out, lower-cased.
+ * Keyword checks run on this, so a literal 'update' or a column [Delete] is not a false alarm, and a
+ * keyword hidden after a comment is still seen.
+ */
+function sqlCode(text) {
+  return String(text)
+    .replace(/--[^\n]*/g, ' ')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/N?'(?:[^']|'')*'/g, "''")
+    .replace(/\[[^\]]*\]/g, '[]')
+    .toLowerCase();
+}
+
+const MUTATION_RE = /\b(update|delete|insert|drop|truncate|alter|merge|create|grant|revoke|deny|commit)\b/;
+
+/**
+ * Pure: why `query` must refuse this SQL, or null. Throws nothing so the rule is testable.
+ *
+ * Two holes closed on 2026-11-09: a `WITH` query skipped the mutation check entirely, so
+ * `WITH c AS (...) DELETE FROM t` ran; and a `DECLARE` prefix let any `EXEC` through, so a
+ * procedure that writes ran outside the journal. A procedure goes through `dbq exec`, which
+ * always rolls back.
+ */
+function readOnlyProblem(text) {
+  const t = sqlCode(text).trim().replace(/^\(+/, '');
   if (!(t.startsWith('select') || t.startsWith('with') || t.startsWith('exec sp_help') || t.startsWith('declare'))) {
-    fail("'query' runs reads only (SELECT/WITH). For mutations use insert/update/delete.");
+    return "'query' runs reads only (SELECT/WITH). For mutations use insert/update/delete; to run a procedure use 'exec'.";
   }
-  if (/\b(update|delete|insert|drop|truncate|alter|merge)\b/.test(t) && !t.startsWith('with')) {
-    fail('The query looks like it contains a mutation. Use the structured commands (insert/update/delete) to keep the journal.');
+  if (MUTATION_RE.test(t)) {
+    return 'The query looks like it contains a mutation. Use the structured commands (insert/update/delete) to keep the journal.';
   }
+  const execs = t.match(/\bexec(?:ute)?\b\s*[^\s(;]*/g) || [];
+  if (execs.some(e => !/^exec\s+sp_help\w*$/.test(e.trim()))) {
+    return "'query' does not run procedures (EXEC). Use 'dbq exec <conn> \"EXEC schema.Proc ...\"', which rolls back.";
+  }
+  return null;
+}
+
+function ensureSelectOnly(text) {
+  const problem = readOnlyProblem(text);
+  if (problem) fail(problem);
+}
+
+/**
+ * Pure: why `exec` must refuse this SQL, or null. One EXEC of a named procedure, nothing else:
+ * no mutation keyword in the batch itself (what the procedure does inside is the rollback's job),
+ * no second statement chained after it.
+ */
+function execProblem(text) {
+  const t = sqlCode(text).trim().replace(/;\s*$/, '');
+  if (!/^exec(?:ute)?\s+[\w\[\]."]+/.test(t)) {
+    return "'exec' runs one procedure call: exec <conn> \"EXEC schema.Proc @a = 1, ...\".";
+  }
+  if (/\bsp_executesql\b|\bexec(?:ute)?\s*\(/.test(t)) {
+    return "'exec' does not run dynamic SQL (sp_executesql / EXEC('...')).";
+  }
+  if ((t.match(/\bexec(?:ute)?\b/g) || []).length > 1 || t.includes(';')) {
+    return "'exec' runs a single procedure call; split the batch.";
+  }
+  if (MUTATION_RE.test(t)) {
+    return "The batch has a mutation keyword outside the procedure call. Use insert/update/delete.";
+  }
+  return null;
+}
+
+/**
+ * Pure: may `exec` run on this connection? A procedure can write, and the only undo is the rollback.
+ * A PROD connection with write rights is refused with no override: one COMMIT inside the procedure
+ * would make its writes permanent. A read-only connection (reader user) is allowed — the server
+ * refuses any write anyway.
+ */
+function execConnProblem(c) {
+  if (c.prod && !c.readonly) {
+    return `Connection is PRODUCTION with write rights. 'exec' is blocked there (no override); use a read-only connection or dev/hml.`;
+  }
+  return null;
 }
 
 /**
@@ -1326,6 +1398,56 @@ function splitDdlBatches(text) {
   return text.split(/^\s*GO\s*;?\s*$/im).map(s => s.trim()).filter(Boolean);
 }
 
+/**
+ * `exec`: runs one procedure call inside a transaction that is ALWAYS rolled back, to read what it
+ * returns and, with --stats, measure it (reads per table + server time). For procedures that only
+ * read, or that write to #temp tables. Every result set is printed.
+ *
+ * If the procedure ends the transaction itself (COMMIT or ROLLBACK inside it), @@TRANCOUNT comes back
+ * 0 and there is nothing left to roll back: the command fails and says so, because any write the
+ * procedure made is now permanent.
+ */
+async function cmdExec(connName, inlineSql, flags) {
+  let text;
+  try { text = sqlFromArgs(inlineSql, flags.file, 'exec <conn> "EXEC schema.Proc ..." | --file <a.sql>'); }
+  catch (e) { return fail(e.message); }
+  const problem = execProblem(text) || execConnProblem(getConn(connName));
+  if (problem) return fail(problem);
+
+  const pool = await getPool(connName);
+  const tx = new sql.Transaction(pool);
+  let open = false;
+  try {
+    await tx.begin();
+    open = true;
+    const req = new sql.Request(tx);
+    const messages = [];
+    req.on('info', m => messages.push(m.message));
+    const t0 = Date.now();
+    const r = await req.query(`${flags.stats ? 'SET STATISTICS IO, TIME ON;\n' : ''}${text}\n;SELECT @@TRANCOUNT AS __dbq_trancount;`);
+    const wallMs = Date.now() - t0;
+    const sets = r.recordsets.slice(0, -1);
+    const tranCount = r.recordsets[r.recordsets.length - 1]?.[0]?.__dbq_trancount;
+    if (tranCount === 0) {
+      open = false;
+      fail('The procedure ended the transaction itself (COMMIT/ROLLBACK inside it). Nothing was rolled back by dbq: '
+        + 'any write it made is PERMANENT. Check it with select before running it again.');
+    }
+    sets.forEach((rows, i) => {
+      if (sets.length > 1) console.log(`-- result set ${i + 1}/${sets.length}`);
+      printRows(rows, flags);
+    });
+    if (sets.length === 0) console.log('(no result set)');
+    if (flags.stats) printStats(parseStatsMessages(messages), wallMs);
+  } finally {
+    if (open) {
+      try { await tx.rollback(); console.error('-- exec: rolled back.'); }
+      catch (e) { console.error('-- exec: rollback failed: ' + e.message); }
+    }
+    await pool.close();
+  }
+}
+
 async function cmdDdl(connName, stmtText, flags) {
   assertDdlAllowed(connName);
 
@@ -1515,6 +1637,7 @@ async function main() {
     case 'delete': return cmdDelete(positionals[0], flags);
     case 'insert': return cmdInsert(positionals[0], flags);
     case 'ddl': return cmdDdl(positionals[0], positionals[1], flags);
+    case 'exec': return cmdExec(positionals[0], positionals[1], flags);
     case 'log': return cmdLog(flags);
     case 'show': return cmdShow(positionals[0], flags);
     case 'revert': return cmdRevert(positionals[0], flags);
@@ -1539,5 +1662,6 @@ module.exports = {
   qual, splitTarget, resolveTarget, schemaFromEnvText,
   parseConnString, parseEnv, clampTop, ttlFromFlag,
   parseStatsMessages, timeoutFromFlag, parseInsertRows, sqlFromArgs, withPositionalTable,
+  sqlCode, readOnlyProblem, execProblem, execConnProblem,
   DEFAULT_SCHEMA, DEFAULT_TOP, MAX_TOP, KNOWN_FLAGS,
 };
