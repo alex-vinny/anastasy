@@ -570,9 +570,12 @@ function runCli(args) {
     'FAKEPRDW_READONLY=false',
     'FAKEDEV=Data Source=fake-dev.invalid;Initial Catalog=appdev;User Id=w;Password=x',
   ].join('\n'));
+  // These cases run against the default dbq.sqlite: the retention setting of whoever runs the suite stays out.
+  const env = { ...process.env, DBQ_ENV_FILE: envFile };
+  delete env.DBQ_JOURNAL_DAYS;
   try {
     const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'index.js'), ...args],
-      { env: { ...process.env, DBQ_ENV_FILE: envFile }, encoding: 'utf8', timeout: 30000 });
+      { env, encoding: 'utf8', timeout: 30000 });
     return { code: r.status, out: r.stdout, err: r.stderr };
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

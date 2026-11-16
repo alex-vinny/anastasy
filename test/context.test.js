@@ -289,14 +289,70 @@ test('prunePlan + applyPrune: old journal and raw texts go, fingerprints and rec
   assert.strictEqual(d.prepare('SELECT COUNT(*) AS n FROM result_cache').get().n, 0);
 });
 
+test('retentionSetting: the environment wins over .env; only whole days turn it on', () => {
+  const s = c.retentionSetting;
+  assert.deepStrictEqual(s(undefined, ''), { days: null, bad: null });
+  assert.deepStrictEqual(s('5', 'DBQ_JOURNAL_DAYS=30'), { days: 5, bad: null });
+  assert.deepStrictEqual(s(undefined, 'A=Data Source=x\nDBQ_JOURNAL_DAYS=7\n'), { days: 7, bad: null });
+  // the last line wins, like any other key of the file; quotes and the 3d form are accepted
+  assert.deepStrictEqual(s(undefined, 'DBQ_JOURNAL_DAYS=7\r\n  DBQ_JOURNAL_DAYS = "3d" \r\n'), { days: 3, bad: null });
+  // a commented line or another key is not the setting
+  assert.deepStrictEqual(s(undefined, '# DBQ_JOURNAL_DAYS=5\nXDBQ_JOURNAL_DAYS=5'), { days: null, bad: null });
+  // an explicit off in the environment beats the file
+  for (const off of ['', '0', '0d', 'off', 'FALSE', 'no']) assert.deepStrictEqual(s(off, 'DBQ_JOURNAL_DAYS=9'), { days: null, bad: null }, off);
+  // a typo must not delete history: it stays off and is reported
+  for (const bad of ['all', '-1', '1.5', '5 days']) assert.deepStrictEqual(s(bad, ''), { days: null, bad }, bad);
+  assert.deepStrictEqual(s(undefined, 'DBQ_JOURNAL_DAYS=soon'), { days: null, bad: 'soon' });
+});
+
+test('applyJournalRetention: entries older than N days go, reverted or not; recent ones stay', () => {
+  const d = memoryDb();
+  const now = Date.parse('2026-03-10T00:00:00.000Z');
+  const ins = d.prepare('INSERT INTO journal (ts, "table", op, reverted) VALUES (?,?,?,?)');
+  ins.run('2026-03-01T00:00:00.000Z', 'T', 'insert', 0);
+  ins.run('2026-03-04T23:59:59.000Z', 'T', 'delete', 1);
+  ins.run('2026-03-05T00:00:01.000Z', 'T', 'update', 0);
+  ins.run('2026-03-09T12:00:00.000Z', 'T', 'ddl', 0);
+  assert.strictEqual(c.applyJournalRetention(d, 5, now), 2);
+  assert.deepStrictEqual(d.prepare('SELECT op FROM journal ORDER BY seq').all().map(x => x.op), ['update', 'ddl']);
+  assert.strictEqual(c.applyJournalRetention(d, 5, now), 0); // nothing left to drop
+});
+
+test('applyJournalRetention: the dropped snapshot does not linger in the file (no VACUUM needed)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbq-ret-'));
+  const file = path.join(dir, 'j.sqlite');
+  const marker = 'CLIENT-ROW-MARKER-';
+  try {
+    let d = new DatabaseSync(file);
+    d.exec('CREATE TABLE journal (seq INTEGER PRIMARY KEY, ts TEXT, statement TEXT, snapshot_gz BLOB, reverted INTEGER DEFAULT 0)');
+    d.prepare('INSERT INTO journal (ts, statement, snapshot_gz) VALUES (?,?,?)')
+      .run('2020-01-01T00:00:00.000Z', marker + 'statement', Buffer.from((marker + 'blob;').repeat(2000))); // spills into overflow pages
+    d.prepare('INSERT INTO journal (ts, statement) VALUES (?,?)').run(new Date().toISOString(), 'recent');
+    d.close();
+    assert.ok(fs.readFileSync(file).includes(marker), 'the snapshot is in the file before');
+    const sizeBefore = fs.statSync(file).size;
+    d = new DatabaseSync(file);
+    assert.strictEqual(c.applyJournalRetention(d, 5), 1);
+    d.close();
+    assert.ok(!fs.readFileSync(file).includes(marker), 'the snapshot bytes are gone from the file');
+    assert.strictEqual(fs.statSync(file).size, sizeBefore); // the pages stay, zeroed, for the next entries
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── CLI (temp dbq.sqlite, fake connections) ──────────────────────────────────
-function runCli(args, dbFile) {
+function runCli(args, dbFile, extra = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbq-ctx-'));
   const envFile = path.join(dir, '.env');
-  fs.writeFileSync(envFile, 'FAKEDEV=Data Source=fake-dev.invalid;Initial Catalog=appdev;User Id=w;Password=x\n');
+  fs.writeFileSync(envFile, ['FAKEDEV=Data Source=fake-dev.invalid;Initial Catalog=appdev;User Id=w;Password=x', ...(extra.envLines || [])].join('\n') + '\n');
+  // The retention setting of whoever runs the suite must not reach the cases: only extra.env turns it on.
+  const env = { ...process.env, DBQ_ENV_FILE: envFile, DBQ_DB_FILE: dbFile || path.join(dir, 'dbq.sqlite') };
+  delete env.DBQ_JOURNAL_DAYS;
+  Object.assign(env, extra.env || {});
   try {
     const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'index.js'), ...args], {
-      env: { ...process.env, DBQ_ENV_FILE: envFile, DBQ_DB_FILE: dbFile || path.join(dir, 'dbq.sqlite') },
+      env,
       encoding: 'utf8', timeout: 30000,
     });
     return { code: r.status, out: r.stdout, err: r.stderr };
@@ -338,6 +394,66 @@ test('CLI prune: a bad --older-than is refused; --yes prunes and reports the siz
     assert.match(r.out, /journal entries\s+1\s+\(1 not reverted/);
     assert.match(r.out, /OK prune: [\d.]+ MB -> [\d.]+ MB/);
     assert.match(runCli(['log', '--all'], dbFile).out, /journal empty/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('CLI DBQ_JOURNAL_DAYS: a working command drops the old entries; log does not; unset, off or bad leaves them', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbq-ret-cli-'));
+  const dbFile = path.join(dir, 'dbq.sqlite');
+  const seed = () => {
+    const d = new DatabaseSync(dbFile);
+    d.exec('DELETE FROM journal');
+    d.prepare(`INSERT INTO journal (seq, id, ts, op, "table", reverted) VALUES (1, 'old1', '2020-01-01T00:00:00.000Z', 'insert', 'T', 0)`).run();
+    d.prepare(`INSERT INTO journal (seq, id, ts, op, "table", reverted) VALUES (2, 'new1', ?, 'update', 'T', 0)`).run(new Date().toISOString());
+    d.close();
+  };
+  const count = () => { const d = new DatabaseSync(dbFile); const n = d.prepare('SELECT COUNT(*) AS n FROM journal').get().n; d.close(); return n; };
+  try {
+    runCli(['history'], dbFile); // creates the schema
+    seed();
+    // unset: nothing happens
+    let r = runCli(['history'], dbFile);
+    assert.strictEqual(count(), 2);
+    assert.doesNotMatch(r.err, /journal:/);
+    // a bad value is reported and ignored; the command still runs
+    r = runCli(['history'], dbFile, { env: { DBQ_JOURNAL_DAYS: 'all' } });
+    assert.strictEqual(r.code, 0);
+    assert.match(r.err, /DBQ_JOURNAL_DAYS="all" ignored/);
+    assert.strictEqual(count(), 2);
+    // the journal commands never trigger it
+    r = runCli(['log', '--all'], dbFile, { env: { DBQ_JOURNAL_DAYS: '5' } });
+    assert.match(r.out, /2020-01-01/); // the old entry is still listed
+    assert.strictEqual(count(), 2);
+    // a working command does, from the environment; stdout stays the command's own
+    r = runCli(['history'], dbFile, { env: { DBQ_JOURNAL_DAYS: '5' } });
+    assert.strictEqual(r.code, 0);
+    assert.match(r.err, /journal: 1 entry older than 5 day\(s\) dropped/);
+    assert.match(r.out, /no read recorded/);
+    assert.doesNotMatch(r.out, /journal:/);
+    assert.strictEqual(count(), 1);
+    // from a line in .env too; an explicit off in the environment wins over the file
+    seed();
+    r = runCli(['conns'], dbFile, { envLines: ['DBQ_JOURNAL_DAYS=5'], env: { DBQ_JOURNAL_DAYS: 'off' } });
+    assert.strictEqual(count(), 2);
+    r = runCli(['conns'], dbFile, { envLines: ['DBQ_JOURNAL_DAYS=5'] });
+    assert.strictEqual(r.code, 0);
+    assert.match(r.err, /journal: 1 entry older than 5 day\(s\) dropped/);
+    assert.strictEqual(count(), 1);
+    assert.doesNotMatch(r.out, /DBQ_JOURNAL_DAYS/); // the setting is not listed as a connection
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('CLI DBQ_JOURNAL_DAYS: without a dbq.sqlite the setting creates nothing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbq-ret-none-'));
+  const dbFile = path.join(dir, 'none.sqlite');
+  try {
+    const r = runCli(['conns'], dbFile, { env: { DBQ_JOURNAL_DAYS: '5' } });
+    assert.strictEqual(r.code, 0);
+    assert.ok(!fs.existsSync(dbFile));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

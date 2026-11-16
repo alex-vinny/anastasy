@@ -18,7 +18,8 @@ PK / identity per table, refetched after 7 days), `result_cache` (opt-in cached 
 **Local files, never committed** (all in `.gitignore`): `.env` (connections), `dbq.sqlite` (the journal holds
 real row snapshots and the history the last raw text of each read, so treat it as the data it came from), and
 `recipes/`, a free folder for your own SQL and notes about your databases. Keep them in this folder: the tool
-reads them from here on every run. `prune` keeps the file from growing without limit.
+reads them from here on every run. `prune` keeps the file from growing without limit, and
+`DBQ_JOURNAL_DAYS` does it for the journal by itself ([Journal retention](#journal-retention-dbq_journal_days)).
 
 ## Requirements
 
@@ -262,6 +263,23 @@ no extra command. The catalog is read first if the connection has none yet (once
 Only names close enough to be the intended one are offered (a short typo, or one name containing another of
 comparable length); with nothing close, there is no hint rather than a guess. Hints carry identifiers only.
 
+### Journal retention (`DBQ_JOURNAL_DAYS`)
+
+The journal holds real row snapshots. To keep only its last days without remembering to `prune`, set
+`DBQ_JOURNAL_DAYS=<n>` in the environment or as a line in `.env` (`5` or `5d`):
+
+- Every run of a working command (anything but `log`, `show`, `revert`, `revert-last` and `prune`) drops the
+  journal entries older than `n` days while the command does its own work. It never delays or fails the
+  command: a busy `dbq.sqlite` just leaves it to the next run.
+- What was dropped is announced on stderr (`-- journal: 3 entries older than 5 day(s) dropped …`), because
+  those mutations can no longer be reverted and `context` no longer counts them.
+- There is no `VACUUM`, since other sessions may share the file. The freed pages are zeroed (`secure_delete`)
+  and reused: the snapshots do not linger, and the file stops growing instead of shrinking. `prune` shrinks it.
+- Off when unset. In the environment, `0`, `off`, `false`, `no` or empty turn it off for a run even when `.env`
+  sets it. A value that is not a whole number of days is reported and ignored.
+
+Raw query texts and cache rows are left to `prune`.
+
 ## How revert works
 
 | Operation | What is recorded | Revert |
@@ -359,7 +377,7 @@ node index.js revert-last
 
 ## Tests
 
-`npm test` (`node --test`) — 183 tests in `test/`, no database or network (the CLI cases run against fake connections via `DBQ_ENV_FILE`, a temp `dbq.sqlite` via `DBQ_DB_FILE`, and stop before connecting; the context storage runs on an in-memory SQLite). `main()` runs only behind
+`npm test` (`node --test`) — 188 tests in `test/`, no database or network (the CLI cases run against fake connections via `DBQ_ENV_FILE`, a temp `dbq.sqlite` via `DBQ_DB_FILE`, and stop before connecting; the context storage runs on an in-memory SQLite). `main()` runs only behind
 `require.main === module`, so the module imports cleanly into the tests.
 
 ## License

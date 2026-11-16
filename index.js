@@ -44,6 +44,9 @@
  *   cache-clear                            Clear the result_cache
  *   prune    [--older-than 30d] [--yes]    Drop journal entries and raw query texts older than N days,
  *                                          expired cache rows, then VACUUM. Preview without --yes.
+ *   DBQ_JOURNAL_DAYS=<n> (environment, or a line in .env) keeps the journal to the last n days by itself:
+ *   every run drops the older entries while the command works, and says so on stderr. Off when unset.
+ *   Entries past n days can no longer be reverted; log, show, revert and prune never trigger it.
  *
  * Context (what dbq.sqlite remembers; every read that reaches the server is recorded):
  *   catalog  <conn> [--refresh]            Tables/columns/PK/FK/descriptions of every schema, one bulk
@@ -2032,6 +2035,31 @@ async function cmdRevertLast(flags) {
   await cmdRevert(row.seq, flags);
 }
 
+// ---------------------------------------------------- journal retention ----
+// The commands that read or prune the journal themselves: retention stays out of their way, so a
+// listing does not change under the reader and an explicit revert is not raced.
+const JOURNAL_COMMANDS = new Set(['log', 'show', 'revert', 'revert-last', 'prune']);
+
+/**
+ * Opt-in journal retention: with DBQ_JOURNAL_DAYS=<n> (environment, or a line in .env) every run drops
+ * the journal entries older than n days. It is scheduled, not awaited: it runs while the command waits
+ * for the server, and a busy or missing dbq.sqlite never fails or delays the command (the next run
+ * tries again). What it dropped is announced on stderr, because those mutations can no longer be undone.
+ */
+function scheduleJournalRetention() {
+  let text = '';
+  try { if (fs.existsSync(ENV_PATH)) text = fs.readFileSync(ENV_PATH, 'utf8'); } catch (_) { /* no .env: environment only */ }
+  const { days, bad } = ctx.retentionSetting(process.env.DBQ_JOURNAL_DAYS, text);
+  if (bad !== null) { console.error(`-- DBQ_JOURNAL_DAYS="${bad}" ignored: it takes a number of days, e.g. 5`); return; }
+  if (!days || !fs.existsSync(DB_PATH)) return;
+  setImmediate(() => {
+    try {
+      const n = ctx.applyJournalRetention(db(), days);
+      if (n) console.error(`-- journal: ${n} entr${n === 1 ? 'y' : 'ies'} older than ${days} day(s) dropped (DBQ_JOURNAL_DAYS); no longer revertible`);
+    } catch (_) { /* busy database: the next run tries again */ }
+  });
+}
+
 // --------------------------------------------------------------- main ----
 async function main() {
   const argv = process.argv.slice(2);
@@ -2041,6 +2069,8 @@ async function main() {
 
   checkUnknownFlags(flags);
   try { REQUEST_TIMEOUT_MS = timeoutFromFlag(flags.timeout) ?? REQUEST_TIMEOUT_MS; } catch (e) { fail(e.message); }
+
+  if (cmd && !JOURNAL_COMMANDS.has(cmd)) scheduleJournalRetention();
 
   switch (cmd) {
     case 'conns': return cmdConns();
