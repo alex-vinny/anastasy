@@ -355,3 +355,77 @@ test('CLI find/context: missing arguments print the usage', () => {
   assert.match(runCli(['find', 'FAKEDEV']).err, /usage: find <conn> <term>/);
   assert.match(runCli(['context', 'FAKEDEV']).err, /usage: context <conn> <table>/);
 });
+
+// ── failure hints (C): the catalog's answer to a wrong name ─────────────────
+const HINT_CATALOG = {
+  tables: ['Order', 'OrderItem', 'Client', 'Invoice'].map(tbl => ({ sch: 'tenant1', tbl })).concat([{ sch: 'tenant2', tbl: 'Order' }]),
+  columns: [
+    ['Order', 'Id'], ['Order', 'Code'], ['Order', 'ClientId'],
+    ['OrderItem', 'Id'], ['OrderItem', 'OrderId'], ['OrderItem', 'Qty'],
+    ['Client', 'Id'], ['Client', 'Name'],
+    ['Invoice', 'Id'], ['Invoice', 'ClientId'],
+  ].map(([tbl, col], i) => ({ sch: 'tenant1', tbl, col, ord: i, type: 'int' })).concat([{ sch: 'tenant2', tbl: 'Order', col: 'Id', ord: 1, type: 'int' }]),
+  fks: [
+    { sch: 'tenant1', tbl: 'OrderItem', col: 'OrderId', ref_sch: 'tenant1', ref_tbl: 'Order', ref_col: 'Id' },
+    { sch: 'tenant1', tbl: 'Order', col: 'ClientId', ref_sch: 'tenant1', ref_tbl: 'Client', ref_col: 'Id' },
+    { sch: 'tenant1', tbl: 'Invoice', col: 'ClientId', ref_sch: 'tenant1', ref_tbl: 'Client', ref_col: 'Id' },
+  ],
+};
+function hintsFor(text, error) {
+  const d = memoryDb();
+  c.storeCatalog(d, 'DEV', HINT_CATALOG);
+  return c.failureHints(d, 'DEV', { text, error, defaultSchema: 'tenant1' });
+}
+
+test('closestNames: short typos and comparable containment; a prefix shared by every table is not close', () => {
+  assert.deepStrictEqual(c.closestNames('Qtty', ['Id', 'OrderId', 'Qty']), ['Qty']);
+  assert.deepStrictEqual(c.closestNames('Expiration', ['ItemExpiration', 'Order', 'Other']), ['ItemExpiration']);
+  assert.deepStrictEqual(c.closestNames('OrderLineExpirations', ['OrderLineExpiration', 'OrderLine', 'Order']), ['OrderLineExpiration']);
+  assert.deepStrictEqual(c.closestNames('Zzz', ['Order', 'Client']), []);
+});
+
+test('failureNames: column, object and ambiguous names, quotes unescaped; other errors give none', () => {
+  assert.deepStrictEqual(c.failureNames("Invalid column name 'A'. Invalid column name 'B''x'."),
+    [{ kind: 'column', name: 'A' }, { kind: 'column', name: "B'x" }]);
+  assert.deepStrictEqual(c.failureNames("Invalid object name 'tenant1.T'."), [{ kind: 'object', name: 'tenant1.T' }]);
+  assert.deepStrictEqual(c.failureNames("Ambiguous column name 'Id'."), [{ kind: 'ambiguous', name: 'Id' }]);
+  assert.deepStrictEqual(c.failureNames('Conversion failed when converting'), []);
+});
+
+test('failureHints: a typo gets the closest column of the tables the query reads', () => {
+  assert.deepStrictEqual(hintsFor('SELECT Qtty FROM tenant1.OrderItem', "Invalid column name 'Qtty'."),
+    ['no column "Qtty" in OrderItem — closest: OrderItem.Qty']);
+});
+
+test('failureHints: the column is on another table of the same query — the qualifier is wrong', () => {
+  assert.deepStrictEqual(
+    hintsFor('SELECT i.Code FROM tenant1.[Order] o JOIN tenant1.OrderItem i ON i.OrderId = o.Id', "Invalid column name 'Code'."),
+    ['"Code" is a column of Order (alias o) in this query — o.Code']);
+});
+
+test('failureHints: the column is one FK away; farther, only the count and the find command', () => {
+  assert.deepStrictEqual(hintsFor('SELECT ClientId FROM tenant1.OrderItem', "Invalid column name 'ClientId'."),
+    ['"ClientId" is a column of Order (FK with OrderItem) — one join away from this query']);
+  assert.deepStrictEqual(hintsFor('SELECT Name FROM tenant1.OrderItem', "Invalid column name 'Name'."),
+    ['"Name" is a column of 1 other table(s), none one FK away from this query — dbq find DEV Name']);
+});
+
+test('failureHints: a table in the wrong schema names the schemas that hold it; a typo gets the closest table', () => {
+  assert.deepStrictEqual(hintsFor('SELECT 1 FROM tenant2.OrderItem', "Invalid object name 'tenant2.OrderItem'."),
+    ['table OrderItem exists in schema(s) tenant1, not in tenant2 — the schema is the tenant']);
+  assert.deepStrictEqual(hintsFor('SELECT 1 FROM tenant1.OrderItems', "Invalid object name 'tenant1.OrderItems'."),
+    ['no table "OrderItems" — closest: OrderItem']);
+});
+
+test('failureHints: an ambiguous column names both tables and the qualified form', () => {
+  assert.deepStrictEqual(
+    hintsFor('SELECT Id FROM tenant1.[Order] o JOIN tenant1.OrderItem i ON i.OrderId = o.Id', "Ambiguous column name 'Id'."),
+    ['"Id" is in Order (alias o) and OrderItem (alias i) — qualify it: o.Id']);
+});
+
+test('failureHints: nothing to say means no hint, never a guess', () => {
+  assert.deepStrictEqual(hintsFor('SELECT Zzzz FROM tenant1.OrderItem', "Invalid column name 'Zzzz'."), []);
+  assert.deepStrictEqual(hintsFor('SELECT 1 FROM tenant1.OrderItem', 'Timeout expired'), []);
+  const empty = memoryDb(); // no catalog for the connection
+  assert.deepStrictEqual(c.failureHints(empty, 'DEV', { text: 'SELECT Qtty FROM t', error: "Invalid column name 'Qtty'." }), []);
+});

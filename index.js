@@ -58,6 +58,9 @@
  *   history  [<conn>] [--table T] [--grep text] [--failed] [--top N] [--raw]
  *                                          Reads as fingerprints (literals shown as ?); --raw shows the last
  *                                          raw text while prune keeps it. Task label: DBQ_TASK or git branch.
+ *   On a failed read, "Invalid column name", "Invalid object name" and "Ambiguous column name" come back
+ *   with hints from the catalog under the error: the closest name, the table of the query (or one FK
+ *   away) that has the column, the schemas that hold the table, the qualified form.
  *
  * Output (token economy):
  *   --format table|tsv|jsonl|json|count    (default: table)
@@ -1276,9 +1279,29 @@ async function logged(connName, op, text, run, rowsOf = (r) => r?.recordset?.len
   };
   let result;
   try { result = await run(); }
-  catch (e) { record({ ok: false, error: e.message }); throw e; }
+  catch (e) {
+    record({ ok: false, error: e.message });
+    const hints = await failureHints(connName, text, e.message);
+    if (hints.length) e.message += '\n' + hints.map(h => `-- hint (catalog of ${connName}): ${h}`).join('\n');
+    throw e;
+  }
   record({ ok: true, rows: rowsOf(result) });
   return result;
+}
+
+/**
+ * The catalog's answer to "Invalid column/object name" and "Ambiguous column name": the closest
+ * names, the schema that holds a table, the table that holds a column. Reads the catalog first when
+ * the connection has none (once; it is then kept for a week). Never masks the original error.
+ */
+async function failureHints(connName, text, message) {
+  if (!ctx.failureNames(message).length) return [];
+  try {
+    if (!ctx.catalogMeta(db(), connName)) await ensureCatalog(connName, false);
+    return ctx.failureHints(db(), connName, { text, error: message, defaultSchema: connDefaultSchema(connName) || DEFAULT_SCHEMA });
+  } catch (e) {
+    return [`none (${e.message})`];
+  }
 }
 
 async function cmdQuery(connName, inlineSql, flags) {

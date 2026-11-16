@@ -245,6 +245,23 @@ node index.js prune                                   # preview; prune --yes app
 Extraction is a tokenizer, not a parser: CTE names, temp tables, table variables and table-valued functions
 are left out, and a join is recorded only when both sides resolve to a table of the same statement.
 
+### Hints on a failed read
+
+When `query`, `select`, `count` or `exec` fails with a wrong name, the catalog answers under the error, with
+no extra command. The catalog is read first if the connection has none yet (once, then kept for a week).
+
+| Server error | Hint |
+|---|---|
+| `Invalid column name 'Totl'` | the closest column of the tables the query reads: `closest: Order.Total` |
+| `Invalid column name 'Code'` on `i.Code` | the table of the same query that has it: `"Code" is a column of Order (alias o) in this query — o.Code` |
+| `Invalid column name 'ClientId'` | a table one FK away that has it: `Order (FK with OrderItem) — one join away`; farther, only the count and `dbq find` |
+| `Invalid object name 'tenant2.Order'` | the schemas that hold the table: `exists in schema(s) tenant1, not in tenant2 — the schema is the tenant` |
+| `Invalid object name 'tenant1.Orders'` | the closest table: `closest: Order` |
+| `Ambiguous column name 'Id'` | both tables and the qualified form: `qualify it: o.Id` |
+
+Only names close enough to be the intended one are offered (a short typo, or one name containing another of
+comparable length); with nothing close, there is no hint rather than a guess. Hints carry identifiers only.
+
 ## How revert works
 
 | Operation | What is recorded | Revert |
@@ -342,7 +359,7 @@ node index.js revert-last
 
 ## Tests
 
-`npm test` (`node --test`) — 175 tests in `test/`, no database or network (the CLI cases run against fake connections via `DBQ_ENV_FILE`, a temp `dbq.sqlite` via `DBQ_DB_FILE`, and stop before connecting; the context storage runs on an in-memory SQLite). `main()` runs only behind
+`npm test` (`node --test`) — 183 tests in `test/`, no database or network (the CLI cases run against fake connections via `DBQ_ENV_FILE`, a temp `dbq.sqlite` via `DBQ_DB_FILE`, and stop before connecting; the context storage runs on an in-memory SQLite). `main()` runs only behind
 `require.main === module`, so the module imports cleanly into the tests.
 
 ## License
