@@ -16,6 +16,10 @@
  *   conns                                  List the configured connections
  *   query    <conn> "<SELECT ...>" | --file <a.sql>   Read-only SQL (SELECT/WITH) [--cache [ttl]] [--stats]
  *                                          --stats: logical/physical reads per table + server time (stderr)
+ *                                          Allowed: SELECT / WITH ... SELECT, optionally after scalar
+ *                                          DECLARE @v type = x / SET @v = x; or ONE system sp_help* (closed
+ *                                          list) | sp_columns | sp_helptext | sp_describe_first_result_set |
+ *                                          sp_spaceused as the whole batch. Procedures go to `exec`.
  *   select   <conn> --table T [--schema sch] [--where "..."] [--top N] [--columns "a,b"]
  *   count    <conn> <table> | --table T [--where "..."]   Just the count (cheap in tokens)
  *   describe <conn> <table> [--schema sch] [--refresh]   Columns/types (uses schema_cache)
@@ -29,6 +33,8 @@
  *   exec     <conn> "EXEC schema.Proc ..." | --file <a.sql>   One procedure call in a transaction that is
  *                                          ALWAYS rolled back; prints every result set [--stats].
  *                                          Refused on PROD write connections (reader user is fine).
+ *                                          [--format table|json] json = {"resultSets":[[...],...]} (one document)
+ *                                          [--out file] the whole json document, no --top cap; stdout gets counts
  *   log [--all]                           List the mutation history
  *   show     <id> [--full]                 Detail one entry (compact; --full = snapshot)
  *   revert   <id>                          Undo one mutation
@@ -47,6 +53,13 @@
  *   - Prod connections refuse mutations without --force-prod (avoid it!).
  *   - ddl runs only on non-prod WRITE connections (dev/hml); it is BLOCKED in prod
  *     (no override) and is not auto-revertible by the journal (op=ddl, undo=none).
+ *   - query strips comments, string literals and [bracketed]/"quoted" identifiers, then refuses
+ *     anywhere in the batch: EXEC/EXECUTE (except the sp_help family above), INSERT, UPDATE,
+ *     DELETE, MERGE, DROP, TRUNCATE, ALTER, CREATE, GRANT/REVOKE/DENY, BACKUP/RESTORE, DBCC,
+ *     KILL, SHUTDOWN, BULK, OPENROWSET/OPENQUERY/OPENDATASOURCE, sp_executesql, xp_*,
+ *     SELECT ... INTO, BEGIN/COMMIT/ROLLBACK, WAITFOR, control flow, cursors and table variables.
+ *     An unterminated literal or comment is refused (fails closed).
+ *   - DBQ_ENV_FILE=<path> reads connections from another .env (tests; announced on stderr).
  *   - A connection WITHOUT Password= in .env uses a session password: resolved via the
  *     DBQ_PASSWORD env var, the 'auth' cache (with a TTL) or an interactive prompt.
  *     It never lives in a config file.
@@ -80,7 +93,13 @@ try {
 const ROOT = __dirname;
 const DB_PATH = path.join(ROOT, 'dbq.sqlite');
 const CONFIG_PATH = path.join(ROOT, 'connections.json');
-const ENV_PATH = path.join(ROOT, '.env');
+// DBQ_ENV_FILE points at another .env — the test suite uses it to run the CLI against fake
+// connections without touching the real file. It is not a new trust boundary (whoever sets the
+// variable could edit .env), but it is announced on stderr so a run against an unexpected file shows.
+const ENV_PATH = process.env.DBQ_ENV_FILE ? path.resolve(process.env.DBQ_ENV_FILE) : path.join(ROOT, '.env');
+if (process.env.DBQ_ENV_FILE && require.main === module) {
+  console.error(`-- connections from DBQ_ENV_FILE=${ENV_PATH}`);
+}
 const DEFAULT_SCHEMA = 'sch';
 const DEFAULT_TOP = 50;
 const MAX_TOP = 500;
@@ -118,7 +137,7 @@ function parseArgs(argv) {
 // propagates. `--no-strict-flags` is the escape hatch.
 const KNOWN_FLAGS = new Set([
   'all', 'cache', 'clear', 'columns', 'device', 'file', 'force-prod', 'format', 'full',
-  'no-strict-flags', 'no-tx', 'password', 'pk', 'refresh', 'schema', 'set', 'table',
+  'no-strict-flags', 'no-tx', 'out', 'password', 'pk', 'refresh', 'schema', 'set', 'table',
   'stats', 'timeout', 'top', 'ttl', 'values', 'values-file', 'where', 'yes',
 ]);
 
@@ -533,14 +552,21 @@ function assertWritable(name, flags) {
 
 // DDL is more dangerous and not revertible: allowed only on non-prod WRITE connections
 // (dev/hml). Production is blocked with NO override — prod DDL goes through the migrations pipeline.
-function assertDdlAllowed(name) {
-  const c = getConn(name);
-  if (c.readonly) {
-    fail(`Connection "${name}" is read-only (user ${c.user}). DDL requires a write connection (dev/hml).`);
-  }
+// Pure (returns the refusal text, or null) so the rule can be unit-tested without a .env.
+function nonProdWriteRefusal(c, name, what) {
+  if (!c) return `Connection "${name}" does not exist. Use 'conns' to list.`;
   if (c.prod) {
-    fail(`Connection "${name}" is PRODUCTION. DDL is blocked in prod (no override). Use the migrations pipeline.`);
+    return `Connection "${name}" is PRODUCTION. ${what} is blocked in prod (no override). Use the migrations pipeline.`;
   }
+  if (c.readonly) {
+    return `Connection "${name}" is read-only (user ${c.user}). ${what} requires a write connection (dev/hml).`;
+  }
+  return null;
+}
+
+function assertDdlAllowed(name) {
+  const refusal = nonProdWriteRefusal(getConn(name), name, 'DDL');
+  if (refusal) fail(refusal);
 }
 
 // -------------------------------------------------------------- journal ----
@@ -897,27 +923,193 @@ function sqlCode(text) {
 
 const MUTATION_RE = /\b(update|delete|insert|drop|truncate|alter|merge|create|grant|revoke|deny|commit)\b/;
 
+// ------------------------------------------------------- read-only guard ----
+// `query` is the only read path that takes free SQL, and it runs against production too, so
+// this guard is the whole of "read-only" there. It blanks out comments, string literals and
+// delimited identifiers (so a word inside them neither trips nor hides anything), tokenizes,
+// and looks at EVERY token of the batch. The grammar accepted is deliberately small — scalar
+// DECLARE / SET @v, then SELECT / WITH ... SELECT; or one sp_help-family procedure as the whole
+// batch. Anything else has a command that journals it or rolls it back.
+
 /**
- * Pure: why `query` must refuse this SQL, or null. Throws nothing so the rule is testable.
- *
- * Two holes closed on 2026-11-09: a `WITH` query skipped the mutation check entirely, so
- * `WITH c AS (...) DELETE FROM t` ran; and a `DECLARE` prefix let any `EXEC` through, so a
- * procedure that writes ran outside the journal. A procedure goes through `dbq exec`, which
- * always rolls back.
+ * Pure: the SQL with comments replaced by a space, string literals by '' and delimited
+ * identifiers ([x] and "x") by []. Block comments nest, as in SQL Server. Throws on an
+ * unterminated literal, identifier or comment — the guard fails closed.
  */
-function readOnlyProblem(text) {
-  const t = sqlCode(text).trim().replace(/^\(+/, '');
-  if (!(t.startsWith('select') || t.startsWith('with') || t.startsWith('exec sp_help') || t.startsWith('declare'))) {
-    return "'query' runs reads only (SELECT/WITH). For mutations use insert/update/delete; to run a procedure use 'exec'.";
+function stripSqlNoise(text) {
+  const s = String(text);
+  const n = s.length;
+  let out = '';
+  let i = 0;
+  const closeQuoted = (open, close, what) => {
+    i++;
+    for (;;) {
+      if (i >= n) throw new Error(`unterminated ${what} (opened with ${open})`);
+      if (s[i] === close) {
+        if (s[i + 1] === close) { i += 2; continue; } // doubled = escaped
+        i++;
+        return;
+      }
+      i++;
+    }
+  };
+  while (i < n) {
+    const c = s[i];
+    const d = s[i + 1];
+    if (c === '-' && d === '-') {
+      const j = s.indexOf('\n', i);
+      i = j === -1 ? n : j;
+      out += ' ';
+    } else if (c === '/' && d === '*') {
+      let depth = 1;
+      i += 2;
+      while (i < n && depth) {
+        if (s[i] === '/' && s[i + 1] === '*') { depth++; i += 2; }
+        else if (s[i] === '*' && s[i + 1] === '/') { depth--; i += 2; }
+        else i++;
+      }
+      if (depth) throw new Error('unterminated /* comment');
+      out += ' ';
+    } else if (c === "'") {
+      closeQuoted("'", "'", 'string literal');
+      out += "''";
+    } else if (c === '[') {
+      closeQuoted('[', ']', 'bracketed identifier');
+      out += '[]';
+    } else if (c === '"') {
+      closeQuoted('"', '"', 'quoted identifier');
+      out += '[]';
+    } else {
+      out += c;
+      i++;
+    }
   }
-  if (MUTATION_RE.test(t)) {
-    return 'The query looks like it contains a mutation. Use the structured commands (insert/update/delete) to keep the journal.';
+  return out;
+}
+
+// Words refused anywhere in a `query` batch, with the command that does the job instead.
+const QUERY_REFUSED = (() => {
+  const m = new Map();
+  const add = (words, hint) => words.split(' ').forEach(w => m.set(w, hint));
+  add('insert update delete merge truncate into', 'row changes go through insert/update/delete (journaled, revertible); SELECT ... INTO needs ddl on a non-prod connection');
+  add('drop alter create grant revoke deny enable disable', 'schema/permission changes go through ddl (non-prod only)');
+  add('backup restore dbcc kill shutdown reconfigure checkpoint setuser', 'server administration is not run by dbq query');
+  add('bulk openrowset openquery opendatasource writetext updatetext', 'external/bulk data access or text writes are not reads');
+  add('sp_executesql', 'dynamic SQL cannot be checked — not run by dbq');
+  add('begin commit rollback save waitfor', 'transactions, blocks and waits are not reads');
+  add('if while goto cursor open deallocate use receive send move', 'control flow, cursors, USE and Service Broker statements are not reads');
+  return m;
+})();
+
+// Read-only system procedures `query` accepts — only as the whole batch, unqualified or `sys.`.
+// A closed list, not /^sp_help\w*$/: anyone with CREATE PROCEDURE can make `dbo.sp_help_purge`,
+// and a dbo/user-schema qualifier would run THAT one. Unqualified system names resolve to sys first.
+const QUERY_SAFE_PROCS = new Set([
+  'sp_help', 'sp_helpconstraint', 'sp_helpdb', 'sp_helpdbfixedrole', 'sp_helpfile', 'sp_helpfilegroup',
+  'sp_helpindex', 'sp_helplanguage', 'sp_helprole', 'sp_helprolemember', 'sp_helprotect', 'sp_helpsort',
+  'sp_helpsrvrole', 'sp_helpsrvrolemember', 'sp_helpstats', 'sp_helptext', 'sp_helptrigger', 'sp_helpuser',
+  'sp_columns', 'sp_describe_first_result_set', 'sp_spaceused',
+]);
+const isSafeProc = (name) => QUERY_SAFE_PROCS.has(name);
+
+/** Pure: tokens of noise-stripped SQL — { t: lowercase text, kind: word|var|num|punct, at, end }. */
+function sqlTokens(clean) {
+  const re = /(0x[0-9a-f]*)|((?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)|([@#][\p{L}\p{N}_@#$]*)|([\p{L}_][\p{L}\p{N}_@#$]*)|(\S)/giu;
+  const out = [];
+  for (const m of String(clean).matchAll(re)) {
+    const kind = m[1] || m[2] ? 'num' : m[3] ? 'var' : m[4] ? 'word' : 'punct';
+    out.push({ t: m[0].toLowerCase(), kind, at: m.index, end: m.index + m[0].length });
   }
-  const execs = t.match(/\bexec(?:ute)?\b\s*[^\s(;]*/g) || [];
-  if (execs.some(e => !/^exec\s+sp_help\w*$/.test(e.trim()))) {
-    return "'query' does not run procedures (EXEC). Use 'dbq exec <conn> \"EXEC schema.Proc ...\"', which rolls back.";
+  return out;
+}
+
+/**
+ * Pure: is this batch a read `query` may run? Returns { ok, problems[] } — every problem found,
+ * not just the first, so one round trip fixes them all.
+ */
+function analyzeReadOnlySql(text) {
+  let clean;
+  try { clean = stripSqlNoise(text); }
+  catch (e) { return { ok: false, problems: [`${e.message} — cannot check a batch whose literals or comments do not close`] }; }
+  const tokens = sqlTokens(clean);
+  const problems = [];
+  const seen = new Set();
+  const add = (p) => { if (!seen.has(p)) { seen.add(p); problems.push(p); } };
+
+  const first = tokens.find(t => t.t !== ';' && t.t !== '(');
+  if (!first) return { ok: false, problems: ['empty query'] };
+  if (first.kind !== 'word' || !['select', 'with', 'declare', 'set', 'exec', 'execute'].includes(first.t)) {
+    // A procedure name as the first statement of a batch runs WITHOUT the word EXEC.
+    add(`must start with SELECT or WITH (optionally after DECLARE @v / SET @v); starts with "${first.t}"`);
+  }
+
+  let execCount = 0;
+  tokens.forEach((tok, i) => {
+    const next = tokens[i + 1];
+    if (tok.kind === 'num' && next && next.at === tok.end && (next.kind === 'word' || next.kind === 'var')) {
+      add(`a number glued to a word ("${clean.slice(tok.at, next.end)}") — put a space or an operator between them`);
+    }
+    if (tok.kind !== 'word') return;
+    const w = tok.t;
+    if (QUERY_REFUSED.has(w)) {
+      add(`${w.toUpperCase()}: ${QUERY_REFUSED.get(w)}`);
+    } else if (/^xp_/.test(w)) {
+      add(`${w}: extended procedures are not run by dbq query`);
+    } else if (w === 'exec' || w === 'execute') {
+      execCount++;
+    } else if (w === 'declare' && !(next && next.kind === 'var' && next.t.startsWith('@'))) {
+      add('DECLARE: only scalar variables (DECLARE @v type = value) are allowed');
+    } else if (w === 'set' && !(next && next.kind === 'var' && next.t.startsWith('@') && !next.t.startsWith('@@'))) {
+      add('SET: only SET @variable = value is allowed (no session options)');
+    } else if (w === 'next' && next && next.t === 'value' && tokens[i + 2] && tokens[i + 2].t === 'for') {
+      add('NEXT VALUE FOR advances a sequence — not a read');
+    }
+  });
+
+  // DECLARE @t TABLE (also inside a comma list: DECLARE @a int, @t TABLE (...)).
+  if (/@[\p{L}\p{N}_@#$]+\s+(?:as\s+)?table\b/iu.test(clean)) {
+    add('table variables (DECLARE @t TABLE) are not allowed — only scalar variables');
+  }
+
+  if (execCount) {
+    const reason = safeExecProblem(clean, execCount, first);
+    if (reason) add(reason);
+  }
+  return { ok: problems.length === 0, problems };
+}
+
+// EXEC passes only as `EXEC [sys.]sp_help|sp_columns|... args` filling the whole batch.
+function safeExecProblem(clean, execCount, first) {
+  const generic = 'EXEC/EXECUTE: query runs only system sp_help* / sp_columns / sp_helptext / '
+    + 'sp_describe_first_result_set / sp_spaceused (unqualified or sys.), alone in the batch — '
+    + "a procedure call goes through 'dbq exec <conn> \"EXEC schema.Proc ...\"', which always rolls back";
+  if (execCount > 1 || first.t !== 'exec' && first.t !== 'execute') return generic;
+  const body = clean.trim().replace(/[\s;]+$/, '').toLowerCase();
+  const ARG = String.raw`(?:@[\p{L}\p{N}_@#$]+\s*=\s*)?(?:n?''|[-+]?[\p{L}\p{N}_.]+|\[\](?:\.\[\])*)(?:\s+out(?:put)?)?`;
+  const m = body.match(new RegExp(String.raw`^;*\s*exec(?:ute)?\s+(?:sys\.)?([\p{L}_][\p{L}\p{N}_]*)((?:\s+${ARG}(?:\s*,\s*${ARG})*)?)$`, 'u'));
+  if (!m) {
+    const proc = (body.match(/exec(?:ute)?\s+(?:sys\.)?([\p{L}_][\p{L}\p{N}_]*)(?![\p{L}\p{N}_.])/u) || [])[1];
+    return proc && isSafeProc(proc)
+      ? `EXEC ${proc}: must be the whole batch (only its arguments may follow) — nothing after it`
+      : generic;
+  }
+  if (!isSafeProc(m[1])) return generic;
+  // sp_spaceused @updateusage = 'true' (or a 2nd positional) runs DBCC UPDATEUSAGE — a write.
+  if (m[1] === 'sp_spaceused' && (/@updateusage/.test(m[2]) || m[2].includes(','))) {
+    return 'sp_spaceused: only the object name is allowed (@updateusage runs DBCC UPDATEUSAGE)';
   }
   return null;
+}
+
+/** Pure: the CLI refusal text for a batch `query` will not run, or null. */
+function readOnlyProblem(text) {
+  const r = analyzeReadOnlySql(text);
+  if (r.ok) return null;
+  return "'query' is read-only and refused this batch (comments, strings and [identifiers] were ignored):\n"
+    + r.problems.map(p => `  - ${p}`).join('\n')
+    + '\nUse insert/update/delete for journaled row changes, ddl for CREATE/ALTER/DROP, or'
+    + " 'dbq exec <conn> \"EXEC schema.Proc ...\"' (always rolled back) for a procedure."
+    + '\nA column named like a keyword can be written [Bracketed].';
 }
 
 function ensureSelectOnly(text) {
@@ -1407,12 +1599,39 @@ function splitDdlBatches(text) {
  * 0 and there is nothing left to roll back: the command fails and says so, because any write the
  * procedure made is now permanent.
  */
+/**
+ * Pure: the json document `exec --format json` prints — ONE document on stdout, so a script can
+ * parse it whole. Each result set follows the same --top / --full rules as `query`; a cut result
+ * set is listed in `truncated` (only present when something was cut). `uncapped` (exec --out)
+ * keeps every row.
+ */
+function execJsonDocument(recordsets, rowsAffected, flags, { uncapped = false } = {}) {
+  const cap = uncapped ? Infinity : clampTop(flags.top || DEFAULT_TOP);
+  const truncated = [];
+  const resultSets = recordsets.map((rows, i) => {
+    const shown = rows.length > cap ? rows.slice(0, cap) : rows;
+    if (shown.length < rows.length) truncated.push({ resultSet: i + 1, shown: shown.length, total: rows.length });
+    if (!shown.length) return [];
+    const cols = visibleColumns(shown, flags.full);
+    return shown.map(r => {
+      const o = {};
+      for (const c of cols) o[c] = r[c] instanceof Date ? r[c].toISOString() : r[c];
+      return o;
+    });
+  });
+  const doc = { resultSets, rowsAffected };
+  if (truncated.length) doc.truncated = truncated;
+  return doc;
+}
+
 async function cmdExec(connName, inlineSql, flags) {
   let text;
   try { text = sqlFromArgs(inlineSql, flags.file, 'exec <conn> "EXEC schema.Proc ..." | --file <a.sql>'); }
   catch (e) { return fail(e.message); }
   const problem = execProblem(text) || execConnProblem(getConn(connName));
   if (problem) return fail(problem);
+  if (flags.out === true || flags.out === '') return fail('--out needs a file path.');
+  const json = String(flags.format || '').toLowerCase() === 'json';
 
   const pool = await getPool(connName);
   const tx = new sql.Transaction(pool);
@@ -1433,11 +1652,20 @@ async function cmdExec(connName, inlineSql, flags) {
       fail('The procedure ended the transaction itself (COMMIT/ROLLBACK inside it). Nothing was rolled back by dbq: '
         + 'any write it made is PERMANENT. Check it with select before running it again.');
     }
-    sets.forEach((rows, i) => {
-      if (sets.length > 1) console.log(`-- result set ${i + 1}/${sets.length}`);
-      printRows(rows, flags);
-    });
-    if (sets.length === 0) console.log('(no result set)');
+    const rowsAffected = (r.rowsAffected || []).slice(0, -1); // the last one is the @@TRANCOUNT probe
+    if (flags.out) {
+      // A proof needs every row, the transcript only the counts: the cap protects the reader, not the file.
+      fs.writeFileSync(flags.out, JSON.stringify(execJsonDocument(sets, rowsAffected, { ...flags, full: true }, { uncapped: true })));
+      console.log(`wrote ${sets.length} result set(s) [${sets.map(s => s.length).join(', ')} row(s)] to ${flags.out}`);
+    } else if (json) {
+      console.log(JSON.stringify(execJsonDocument(sets, rowsAffected, flags)));
+    } else {
+      sets.forEach((rows, i) => {
+        if (sets.length > 1) console.log(`-- result set ${i + 1}/${sets.length}`);
+        printRows(rows, flags);
+      });
+      if (sets.length === 0) console.log('(no result set)');
+    }
     if (flags.stats) printStats(parseStatsMessages(messages), wallMs);
   } finally {
     if (open) {
@@ -1663,5 +1891,6 @@ module.exports = {
   parseConnString, parseEnv, clampTop, ttlFromFlag,
   parseStatsMessages, timeoutFromFlag, parseInsertRows, sqlFromArgs, withPositionalTable,
   sqlCode, readOnlyProblem, execProblem, execConnProblem,
+  stripSqlNoise, analyzeReadOnlySql, nonProdWriteRefusal, splitDdlBatches, execJsonDocument,
   DEFAULT_SCHEMA, DEFAULT_TOP, MAX_TOP, KNOWN_FLAGS,
 };

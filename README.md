@@ -168,7 +168,9 @@ not hide it. `--stats` skips `--cache` (a cached answer has no reads).
 `query` does not run `EXEC`. To read what a procedure returns, or to measure it, use `exec`:
 
 ```bash
-dbq exec DEV1 "EXEC tenant1.usp_Report '825', 0, 54222761, '1,2,3', NULL, 0, 0, 0" --stats --format count
+dbq exec DEV "EXEC tenant1.usp_Report @Id = 1, @From = '2026-01-01'" --stats --format count
+dbq exec DEV "EXEC tenant1.usp_Report @Id = 1" --format json            # ONE document: {"resultSets":[[...]],"rowsAffected":[...]}
+dbq exec DEV "EXEC tenant1.usp_Report @Id = 1" --out ./report.json      # every row of every set, no --top cap
 ```
 
 - One procedure call per run: no second statement, no dynamic SQL (`sp_executesql`, `EXEC('...')`),
@@ -181,6 +183,9 @@ dbq exec DEV1 "EXEC tenant1.usp_Report '825', 0, 54222761, '1,2,3', NULL, 0, 0, 
   is allowed; the server refuses writes there anyway.
 - Before running a procedure that can loop (a `WHILE` over input), check the input: the rollback undoes
   writes, not the CPU a loop burns on a shared database until `--timeout`.
+- `--format json` prints one document for all result sets (each capped by `--top`; a cut set is listed in
+  `truncated`). `--out <file>` writes that document with every row and column to the file and prints only
+  the counts: use it when a comparison needs the whole result and the transcript only the totals.
 
 Per-statement cost of a procedure, after running it: `sys.dm_exec_query_stats` × `sys.dm_exec_sql_text`
 filtered by `objectid = OBJECT_ID('<schema>.<proc>')`, ordered by `last_logical_reads`.
@@ -207,9 +212,14 @@ an insert with a `delete` whose `--where` names every key column.
 - Mutations require `--yes`. Without it → **dry-run** (shows SQL, count, snapshot).
 - `readonly:true` connections **refuse** any mutation.
 - `prod:true` connections **block** mutations unless `--force-prod` (avoid it).
-- `query` accepts only `SELECT`/`WITH`; raw-SQL mutations are refused so the
-  journal is never bypassed. The check ignores string literals, comments and `[identifiers]`, and
-  applies to `WITH` too. Until 2026-11-09 a `WITH ... DELETE` and a `DECLARE ...; EXEC proc` passed it.
+- `query` accepts only `SELECT` / `WITH ... SELECT`, optionally after scalar `DECLARE @v` / `SET @v`, or
+  one system `sp_help*` / `sp_columns` / `sp_helptext` / `sp_describe_first_result_set` / `sp_spaceused`
+  as the whole batch (a closed list: a user procedure named `sp_help_x` does not pass). It blanks out
+  comments, string literals and `[bracketed]`/`"quoted"` identifiers, then checks **every token of the
+  batch** and lists every problem it finds: `EXEC`, DML, `MERGE`, `SELECT ... INTO`, DDL, permissions,
+  `BACKUP`/`DBCC`/`KILL`, `OPENROWSET`/`OPENQUERY`, `sp_executesql`, `xp_*`, transactions, `WAITFOR`,
+  control flow, cursors, table variables, session `SET` options. A literal or comment that does not close
+  is refused (fails closed).
 - `exec` runs one procedure call and always rolls back (see *Measuring a procedure*).
 - `ddl` runs only on **non-prod write** connections (dev/hml). It is **blocked
   in prod** (prod DDL goes through the migrations pipeline) and is **not
