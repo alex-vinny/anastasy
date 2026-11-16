@@ -6,3 +6,4 @@ connections.json
 # Local backups of .env hold real connection strings.
 .env.*
 !.env.example
+recipes/

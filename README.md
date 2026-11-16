@@ -15,6 +15,10 @@ with three tables — `journal` (a gzipped row snapshot per mutation),
 `schema_cache` (columns / types / PK / identity per table), and `result_cache`
 (opt-in cached reads with a TTL).
 
+**Local files, never committed** (all in `.gitignore`): `.env` (connections), `dbq.sqlite` (the journal holds
+real row snapshots, so treat it as the data it came from), and `recipes/`, a free folder for your own SQL and
+notes about your databases. Keep them in this folder: the tool reads them from here on every run.
+
 ## Requirements
 
 - **Node.js 22+** (uses the built-in `node:sqlite`)
@@ -122,6 +126,14 @@ affected count, and the snapshot. `--pk` is required in practice for
 without running anything. An unknown flag is still refused (exit 1); for flags borrowed
 from other CLIs the refusal names the real spelling (`--json` → `--format json`,
 `--limit` → `--top N`, `--conn` → the connection is the first positional).
+`--no-strict-flags` turns the refusal into a warning, for unattended pipelines only: a dropped `--yes`
+turns a mutation into a dry-run and a dropped `--where` removes a `DELETE`'s filter, so never use it to get
+past a typo.
+
+> ⚠️ **`insert` prints two numbers:** `OK insert: PK(s) 369. journal #248. revert: …`. A script that loads
+> parent/child rows must read the parent id with an anchored regex (`PK\(s\)\s+(\d+)`); a loose `\d+` picks the
+> journal number and the children land under the wrong parent with no error. After such a load, check children
+> per parent, orphans and FKs, and keep the journal range (revert newest to oldest).
 
 ### Helper scripts (`scripts/`)
 
@@ -284,6 +296,11 @@ node index.js show 3
 node index.js revert 3
 node index.js revert-last
 ```
+
+## Tests
+
+`npm test` (`node --test`) — 147 tests in `test/`, no database or network (the CLI cases run against fake connections via `DBQ_ENV_FILE` and stop before connecting). `main()` runs only behind
+`require.main === module`, so the module imports cleanly into the tests.
 
 ## License
 
