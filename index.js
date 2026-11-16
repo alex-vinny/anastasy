@@ -6,14 +6,16 @@
  * "git-like" undo journal: every mutation records the prior state (or the
  * inserted PKs) so it can be reverted.
  *
- * Storage: local SQLite (node:sqlite, built into Node 22+) in dbq.sqlite —
- *   journal (with a gzipped snapshot), schema_cache and result_cache.
+ * Storage: local SQLite (node:sqlite, built into Node 22+) in dbq.sqlite, one per user, never
+ *   committed — journal (with a gzipped snapshot), schema_cache, result_cache, and the context
+ *   tables: catalog (tables/columns/PK/FK per connection), query history (fingerprints) and joins.
  *
  * Usage:
  *   node index.js <command> [options]
  *
  * Commands:
  *   conns                                  List the configured connections
+ *   schemas  <conn> [--table T]            The user schemas of the database; with --table, which hold it
  *   query    <conn> "<SELECT ...>" | --file <a.sql>   Read-only SQL (SELECT/WITH) [--cache [ttl]] [--stats]
  *                                          --stats: logical/physical reads per table + server time (stderr)
  *                                          Allowed: SELECT / WITH ... SELECT, optionally after scalar
@@ -35,11 +37,27 @@
  *                                          Refused on PROD write connections (reader user is fine).
  *                                          [--format table|json] json = {"resultSets":[[...],...]} (one document)
  *                                          [--out file] the whole json document, no --top cap; stdout gets counts
- *   log [--all]                           List the mutation history
+ *   log [--all] [--top N]                  The mutation history, newest N (default 50); --all includes reverted
  *   show     <id> [--full]                 Detail one entry (compact; --full = snapshot)
  *   revert   <id>                          Undo one mutation
  *   revert-last                            Undo the most recent non-reverted mutation
  *   cache-clear                            Clear the result_cache
+ *   prune    [--older-than 30d] [--yes]    Drop journal entries and raw query texts older than N days,
+ *                                          expired cache rows, then VACUUM. Preview without --yes.
+ *
+ * Context (what dbq.sqlite remembers; every read that reaches the server is recorded):
+ *   catalog  <conn> [--refresh]            Tables/columns/PK/FK/descriptions of every schema, one bulk
+ *                                          read of sys.*; refreshed by itself when older than 7 days
+ *   find     <conn> <term> [--schema s]    Tables and columns whose name contains <term>, grouped across
+ *                                          the schemas (tenants) that hold them
+ *   context  <conn> <table> [--schema s]   One block: columns with PK/FK, joins, recent successful reads,
+ *                                          journal counts of the last 30 days [--format json]
+ *   The catalog is per connection; history and joins are per PROJECT: <CONN>_PROJECT=<name> in .env
+ *   groups the connections of one system (dev/hml/prd); unset, a connection is its own project.
+ *   joins    <conn> <table>                Join columns of a table: declared FKs + equalities seen in reads
+ *   history  [<conn>] [--table T] [--grep text] [--failed] [--top N] [--raw]
+ *                                          Reads as fingerprints (literals shown as ?); --raw shows the last
+ *                                          raw text while prune keeps it. Task label: DBQ_TASK or git branch.
  *
  * Output (token economy):
  *   --format table|tsv|jsonl|json|count    (default: table)
@@ -60,6 +78,7 @@
  *     SELECT ... INTO, BEGIN/COMMIT/ROLLBACK, WAITFOR, control flow, cursors and table variables.
  *     An unterminated literal or comment is refused (fails closed).
  *   - DBQ_ENV_FILE=<path> reads connections from another .env (tests; announced on stderr).
+ *     DBQ_DB_FILE=<path> uses another dbq.sqlite (tests).
  *   - A connection WITHOUT Password= in .env uses a session password: resolved via the
  *     DBQ_PASSWORD env var, the 'auth' cache (with a TTL) or an interactive prompt.
  *     It never lives in a config file.
@@ -90,8 +109,10 @@ try {
   process.exit(1);
 }
 
+const ctx = require('./lib/context.js');
+
 const ROOT = __dirname;
-const DB_PATH = path.join(ROOT, 'dbq.sqlite');
+const DB_PATH = process.env.DBQ_DB_FILE ? path.resolve(process.env.DBQ_DB_FILE) : path.join(ROOT, 'dbq.sqlite');
 const CONFIG_PATH = path.join(ROOT, 'connections.json');
 // DBQ_ENV_FILE points at another .env — the test suite uses it to run the CLI against fake
 // connections without touching the real file. It is not a new trust boundary (whoever sets the
@@ -136,9 +157,9 @@ function parseArgs(argv) {
 // reads the exit code — a warning plus exit 0 reads as success and the wrong belief
 // propagates. `--no-strict-flags` is the escape hatch.
 const KNOWN_FLAGS = new Set([
-  'all', 'cache', 'clear', 'columns', 'device', 'file', 'force-prod', 'format', 'full',
-  'no-strict-flags', 'no-tx', 'out', 'password', 'pk', 'refresh', 'schema', 'set', 'table',
-  'stats', 'timeout', 'top', 'ttl', 'values', 'values-file', 'where', 'yes',
+  'all', 'cache', 'clear', 'columns', 'device', 'failed', 'file', 'force-prod', 'format', 'full',
+  'grep', 'no-strict-flags', 'no-tx', 'older-than', 'out', 'password', 'pk', 'raw', 'refresh',
+  'schema', 'set', 'table', 'stats', 'timeout', 'top', 'ttl', 'values', 'values-file', 'where', 'yes',
 ]);
 
 /**
@@ -274,6 +295,7 @@ function db() {
       created_at TEXT
     );
   `);
+  ctx.initContextSchema(_db);
   return _db;
 }
 
@@ -300,7 +322,7 @@ function parseConnString(cs) {
   };
 }
 
-// Reads a .env (KEY=connstring). Optional suffixes <NAME>_READONLY / <NAME>_PROD / <NAME>_DESC.
+// Reads a .env (KEY=connstring). Optional suffixes <NAME>_READONLY / _PROD / _DESC / _SCHEMA / _PROJECT.
 function parseEnv(text) {
   const raw = {};
   for (let line of text.split(/\r?\n/)) {
@@ -315,7 +337,7 @@ function parseEnv(text) {
   }
   const conns = {};
   for (const [key, val] of Object.entries(raw)) {
-    if (/_(READONLY|PROD|DESC|SCHEMA)$/i.test(key)) continue;
+    if (/_(READONLY|PROD|DESC|SCHEMA|PROJECT)$/i.test(key)) continue;
     if (!/data source\s*=|server\s*=/i.test(val)) continue; // connection strings only
     const p = parseConnString(val);
     const isReader = (p.user || '').toLowerCase().includes('reader');
@@ -327,6 +349,8 @@ function parseEnv(text) {
     p.desc = (raw[key + '_DESC'] || '').trim() || undefined;
     // A schema here is a TENANT, so the right default is per-connection, not global.
     p.schema = (raw[key + '_SCHEMA'] || '').trim() || undefined;
+    // Connections of one system (dev/hml/prd) share history and joins; unset = its own project.
+    p.project = (raw[key + '_PROJECT'] || '').trim() || undefined;
     conns[key] = p;
   }
   return conns;
@@ -638,8 +662,10 @@ async function getTableMeta(pool, conn, schema, table, refresh) {
   const key = `${conn}:${schema}.${table}`;
   const d = db();
   if (!refresh) {
-    const row = d.prepare('SELECT columns_json FROM schema_cache WHERE key=?').get(key);
-    if (row) return JSON.parse(row.columns_json);
+    // A cached shape older than a week is fetched again: a column a migration added since would
+    // otherwise stay invisible to describe/insert/update until someone passed --refresh.
+    const row = d.prepare('SELECT columns_json, fetched_at FROM schema_cache WHERE key=?').get(key);
+    if (row && !ctx.olderThan(row.fetched_at, ctx.SCHEMA_CACHE_TTL_DAYS)) return JSON.parse(row.columns_json);
   }
   const cols = await fetchTableMeta(pool, schema, table);
   if (cols) {
@@ -754,6 +780,14 @@ function connDefaultSchema(connName) {
 }
 function nowIso() { return new Date().toISOString(); }
 
+/** The project a connection belongs to (`<CONN>_PROJECT`), and every connection of that project. */
+function connProject(connName) {
+  return getConn(connName).project || connName;
+}
+function projectConns(project) {
+  return Object.entries(loadConnections()).filter(([n, c]) => (c.project || n) === project).map(([n]) => n);
+}
+
 // Binds a JS object's values as named parameters on an mssql request.
 function bindParams(request, obj, prefix) {
   const names = {};
@@ -855,6 +889,7 @@ async function cmdConns() {
     }
     console.log(`${name.padEnd(12)} ${c.server} / ${c.database}  [${tags.join(' ')}]  user=${c.user || '(azure ad)'}`);
     if (c.desc) console.log(`${' '.repeat(12)}   ↳ ${c.desc}`);
+    if (c.project) console.log(`${' '.repeat(12)}   ↳ project ${c.project} (history and joins shared with its other connections)`);
   }
 }
 
@@ -1229,6 +1264,23 @@ function withPositionalTable(flags, positional) {
   return { ...flags, table: positional };
 }
 
+/**
+ * Runs one read against the server and records it in the history (fingerprint, outcome, time,
+ * row count, task label). A failure to record is reported on stderr and never fails the read.
+ */
+async function logged(connName, op, text, run, rowsOf = (r) => r?.recordset?.length ?? null) {
+  const t0 = Date.now();
+  const record = (outcome) => {
+    try { ctx.recordRead(db(), { conn: connName, project: connProject(connName), op, text, task: ctx.taskLabel(), ms: Date.now() - t0, ...outcome }); }
+    catch (e) { console.error('-- history not recorded: ' + e.message); }
+  };
+  let result;
+  try { result = await run(); }
+  catch (e) { record({ ok: false, error: e.message }); throw e; }
+  record({ ok: true, rows: rowsOf(result) });
+  return result;
+}
+
 async function cmdQuery(connName, inlineSql, flags) {
   let queryText;
   try { queryText = sqlFromArgs(inlineSql, flags.file, 'query <conn> "SELECT ..." | --file <a.sql>'); }
@@ -1242,7 +1294,7 @@ async function cmdQuery(connName, inlineSql, flags) {
   }
   const pool = await getPool(connName);
   try {
-    const r = await pool.request().query(queryText);
+    const r = await logged(connName, 'query', queryText, () => pool.request().query(queryText));
     if (ttl) cachePut(connName, queryText, r.recordset, ttl);
     printRows(r.recordset, flags);
   } finally {
@@ -1259,7 +1311,7 @@ async function cmdQueryWithStats(connName, queryText, flags) {
     const messages = [];
     req.on('info', m => messages.push(m.message));
     const t0 = Date.now();
-    const r = await req.query(`SET STATISTICS IO, TIME ON;\n${queryText}`);
+    const r = await logged(connName, 'query', queryText, () => req.query(`SET STATISTICS IO, TIME ON;\n${queryText}`));
     const wallMs = Date.now() - t0;
     printRows(r.recordset, flags);
     printStats(parseStatsMessages(messages), wallMs);
@@ -1282,7 +1334,7 @@ async function cmdSelect(connName, flags) {
   const pool = await getPool(connName);
   try {
     console.log('SQL> ' + q);
-    const r = await pool.request().query(q);
+    const r = await logged(connName, 'select', q, () => pool.request().query(q));
     if (ttl) cachePut(connName, q, r.recordset, ttl);
     printRows(r.recordset, flags);
   } finally {
@@ -1296,7 +1348,7 @@ async function cmdCount(connName, flags) {
   const q = `SELECT COUNT(*) AS n FROM ${qual(schema, table)} ${where}`.trim();
   const pool = await getPool(connName);
   try {
-    const r = await pool.request().query(q);
+    const r = await logged(connName, 'count', q, () => pool.request().query(q));
     console.log(r.recordset[0].n);
   } finally {
     await pool.close();
@@ -1643,7 +1695,9 @@ async function cmdExec(connName, inlineSql, flags) {
     const messages = [];
     req.on('info', m => messages.push(m.message));
     const t0 = Date.now();
-    const r = await req.query(`${flags.stats ? 'SET STATISTICS IO, TIME ON;\n' : ''}${text}\n;SELECT @@TRANCOUNT AS __dbq_trancount;`);
+    const r = await logged(connName, 'exec', text,
+      () => req.query(`${flags.stats ? 'SET STATISTICS IO, TIME ON;\n' : ''}${text}\n;SELECT @@TRANCOUNT AS __dbq_trancount;`),
+      (res) => (res?.recordsets || []).slice(0, -1).reduce((s, set) => s + set.length, 0));
     const wallMs = Date.now() - t0;
     const sets = r.recordsets.slice(0, -1);
     const tranCount = r.recordsets[r.recordsets.length - 1]?.[0]?.__dbq_trancount;
@@ -1735,10 +1789,16 @@ async function cmdDdl(connName, stmtText, flags) {
 }
 
 function cmdLog(flags) {
+  // Newest N, printed oldest first: the whole journal (thousands of entries) in an agent's context
+  // costs tokens and repeats WHERE clauses that may carry customer values.
+  const top = clampTop(flags.top || DEFAULT_TOP);
+  const filter = flags.all ? '' : 'WHERE reverted=0';
+  const total = db().prepare(`SELECT COUNT(*) AS n FROM journal ${filter}`).get().n;
   const rows = db().prepare(
     `SELECT seq, ts, op, connection, schema, "table" AS tbl, affected, where_clause, reverted
-     FROM journal ${flags.all ? '' : 'WHERE reverted=0'} ORDER BY seq`).all();
+     FROM journal ${filter} ORDER BY seq DESC LIMIT ?`).all(top).reverse();
   if (rows.length === 0) { console.log('(journal empty)'); return; }
+  if (total > rows.length) console.log(`(newest ${rows.length} of ${total}; --top N for more, max ${MAX_TOP})`);
   for (const e of rows) {
     const rev = e.reverted ? ' [REVERTED]' : '';
     console.log(`#${String(e.seq).padStart(4)} ${e.ts}  ${String(e.op).toUpperCase().padEnd(6)} ${e.connection}:${e.schema}.${e.tbl}  affected=${e.affected}${rev}`);
@@ -1758,6 +1818,116 @@ function cmdShow(id, flags) {
     undo: `${e.undo.kind} (${undoSize})`, reverted: e.reverted, revertedAt: e.revertedAt
   }, null, 2));
   console.log(`(use 'show ${e.seq} --full' to see the full snapshot)`);
+}
+
+function cmdPrune(flags) {
+  let days;
+  try { days = ctx.parseAgeDays(flags['older-than']); } catch (e) { return fail(e.message); }
+  const d = db();
+  const plan = ctx.prunePlan(d, days);
+  const sizeOf = () => { try { return fs.statSync(DB_PATH).size; } catch { return 0; } };
+  const mb = (b) => (b / 1048576).toFixed(1) + ' MB';
+  console.log(`prune: older than ${days} day(s) (before ${plan.cutoff.slice(0, 10)})`);
+  console.log(`  journal entries      ${plan.journal}  (${plan.journalLive} not reverted: they can no longer be undone)`);
+  console.log(`  raw query texts      ${plan.rawQueries}  (fingerprints stay)`);
+  console.log(`  expired cache rows   ${plan.resultCache}`);
+  if (!flags.yes) { console.log(`\nDRY RUN (${mb(sizeOf())} now) — nothing removed. Re-run with --yes.`); return; }
+  const before = sizeOf();
+  ctx.applyPrune(d, plan);
+  console.log(`\nOK prune: ${mb(before)} -> ${mb(sizeOf())}.`);
+}
+
+/** The catalog of `conn`, read again from sys.* when missing, older than a week, or on --refresh. */
+async function ensureCatalog(connName, refresh) {
+  getConn(connName); // unknown connection fails here, before any network
+  const d = db();
+  if (!refresh && !ctx.catalogStale(d, connName)) return ctx.catalogMeta(d, connName);
+  const pool = await getPool(connName);
+  try {
+    const t0 = Date.now();
+    const [tables, columns, fks] = await Promise.all(
+      ['tables', 'columns', 'fks'].map(k => pool.request().query(ctx.CATALOG_SQL[k]).then(r => r.recordset)));
+    ctx.storeCatalog(d, connName, { tables, columns, fks });
+    console.error(`-- catalog of ${connName} read: ${tables.length} tables, ${columns.length} columns, ${fks.length} FK columns (${Date.now() - t0} ms)`);
+  } finally {
+    await pool.close();
+  }
+  return ctx.catalogMeta(d, connName);
+}
+
+async function cmdCatalog(connName, flags) {
+  if (!connName) fail('usage: catalog <conn> [--refresh]');
+  const m = await ensureCatalog(connName, !!flags.refresh);
+  console.log(`${connName}: ${m.schemas} schema(s), ${m.tables} tables, ${m.columns} columns, ${m.fks} FK columns`
+    + ` — read ${m.fetched_at.slice(0, 16).replace('T', ' ')} UTC, refreshed by itself after ${ctx.CATALOG_TTL_DAYS} days.`);
+}
+
+async function cmdFind(connName, term, flags) {
+  if (!connName || !term) fail('usage: find <conn> <term> [--schema s] [--top N]');
+  await ensureCatalog(connName, false);
+  const top = clampTop(flags.top || 30);
+  const schema = flags.schema && flags.schema !== true ? String(flags.schema) : null;
+  const r = ctx.searchCatalog(db(), connName, term, { schema, top, preferSchema: connDefaultSchema(connName) || DEFAULT_SCHEMA });
+  if (String(flags.format || '').toLowerCase() === 'json') { console.log(JSON.stringify(r)); return; }
+  const where = (schemas) => schemas.length === 1 ? schemas[0] : `${schemas.length} schemas`;
+  console.log(`Tables matching "${term}" on ${connName}: ${r.tablesTotal}${r.tablesTotal > r.tables.length ? ` (first ${r.tables.length})` : ''}`);
+  for (const t of r.tables) {
+    const rows = t.rowsEst === null || t.rowsEst === undefined ? '' : `~${Number(t.rowsEst).toLocaleString('en-US')} rows`;
+    console.log(`  ${t.table.padEnd(40)} ${where(t.schemas).padEnd(12)} ${rows}${t.descr ? `  -- ${t.descr}` : ''}`.trimEnd());
+  }
+  console.log(`Columns matching "${term}": ${r.columnsTotal}${r.columnsTotal > r.columns.length ? ` (first ${r.columns.length})` : ''}`);
+  for (const c of r.columns) {
+    console.log(`  ${`${c.table}.${c.column}`.padEnd(56)} ${c.type.padEnd(16)} ${where(c.schemas)}`);
+  }
+}
+
+async function cmdContext(connName, table, flags) {
+  if (!connName || !table) fail('usage: context <conn> <table> [--schema s] [--format json]');
+  await ensureCatalog(connName, false);
+  const { schema, table: tbl } = splitTarget(String(table), null);
+  const wanted = flags.schema && flags.schema !== true ? String(flags.schema) : schema;
+  const project = connProject(connName);
+  const c = ctx.contextData(db(), connName, tbl, {
+    schema: wanted, defaultSchema: connDefaultSchema(connName) || DEFAULT_SCHEMA, project, conns: projectConns(project),
+  });
+  if (!c) {
+    fail(`No table "${tbl}"${wanted ? ` in schema ${wanted}` : ''} in the catalog of ${connName}. `
+      + `Search by part of the name:  dbq find ${connName} ${tbl.slice(0, 12)}   (or catalog ${connName} --refresh after a migration)`);
+  }
+  if (String(flags.format || '').toLowerCase() === 'json') { console.log(JSON.stringify(c)); return; }
+  console.log(ctx.formatContext(c));
+}
+
+async function cmdJoins(connName, table, flags) {
+  if (!connName || !table) fail('usage: joins <conn> <table> [--top N]');
+  await ensureCatalog(connName, false);
+  const rows = ctx.joinRows(db(), connName, table, { top: clampTop(flags.top || 20), project: connProject(connName) });
+  if (!rows.length) { console.log(`No join known for ${table}: no FK declared and none seen in your reads yet.`); return; }
+  console.log(`Joins of ${table} (fk = declared on ${connName}, log = seen in reads of project ${connProject(connName)}):`);
+  for (const j of rows) console.log(`  ${`${j.from.t}.${j.from.c} = ${j.to.t}.${j.to.c}`.padEnd(70)} ${j.source}${j.seen ? ` x${j.seen}` : ''}`);
+}
+
+function cmdHistory(connName, flags) {
+  const rows = ctx.historyRows(db(), {
+    conn: connName || null,
+    table: flags.table && flags.table !== true ? String(flags.table) : null,
+    grep: flags.grep && flags.grep !== true ? String(flags.grep) : null,
+    failed: !!flags.failed,
+    top: clampTop(flags.top || 20),
+  });
+  if (String(flags.format || '').toLowerCase() === 'json') {
+    console.log(JSON.stringify(rows.map(r => ({ ...r, sql_raw: flags.raw ? r.sql_raw : undefined }))));
+    return;
+  }
+  if (!rows.length) { console.log('(no read recorded for this filter)'); return; }
+  for (const r of rows) {
+    const failedRuns = r.runs - r.ok_runs;
+    const avg = Math.round(r.ms_total / Math.max(r.runs, 1));
+    console.log(`[${r.hash}] ${r.last_at.slice(0, 16).replace('T', ' ')}  ${r.conn}  ${r.op}  x${r.runs}${failedRuns ? ` (${failedRuns} failed)` : ''}`
+      + `  avg ${avg} ms${r.rows_last !== null ? `  rows ${r.rows_last}` : ''}${r.task ? `  task ${r.task}` : ''}`);
+    console.log(`    ${flags.raw && r.sql_raw ? r.sql_raw.replace(/\s+/g, ' ').trim() : r.sql_fp}`);
+    if (!r.last_ok && r.last_error) console.log(`    last error: ${r.last_error}`);
+  }
 }
 
 function cmdCacheClear() {
@@ -1871,6 +2041,12 @@ async function main() {
     case 'revert': return cmdRevert(positionals[0], flags);
     case 'revert-last': return cmdRevertLast(flags);
     case 'cache-clear': return cmdCacheClear();
+    case 'prune': return cmdPrune(flags);
+    case 'catalog': return cmdCatalog(positionals[0], flags);
+    case 'find': return cmdFind(positionals[0], positionals[1], flags);
+    case 'context': return cmdContext(positionals[0], positionals[1], flags);
+    case 'joins': return cmdJoins(positionals[0], positionals[1], flags);
+    case 'history': return cmdHistory(positionals[0], flags);
     default:
       console.log(usageText());
       if (cmd) fail('Unknown command: ' + cmd);

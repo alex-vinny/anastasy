@@ -10,14 +10,15 @@ audited in the journal but is **not** auto-revertible (see [Safety](#safety)).
 node index.js <command>
 ```
 
-**Storage:** a local SQLite file (`dbq.sqlite`, via the built-in `node:sqlite`)
-with three tables — `journal` (a gzipped row snapshot per mutation),
-`schema_cache` (columns / types / PK / identity per table), and `result_cache`
-(opt-in cached reads with a TTL).
+**Storage:** a local SQLite file (`dbq.sqlite`, via the built-in `node:sqlite`), one per user, built by
+the tool on first run — `journal` (a gzipped row snapshot per mutation), `schema_cache` (columns / types /
+PK / identity per table, refetched after 7 days), `result_cache` (opt-in cached reads with a TTL), and the
+[context](#context-what-dbqsqlite-remembers) tables: the catalog, the read history and the joins learned from it.
 
 **Local files, never committed** (all in `.gitignore`): `.env` (connections), `dbq.sqlite` (the journal holds
-real row snapshots, so treat it as the data it came from), and `recipes/`, a free folder for your own SQL and
-notes about your databases. Keep them in this folder: the tool reads them from here on every run.
+real row snapshots and the history the last raw text of each read, so treat it as the data it came from), and
+`recipes/`, a free folder for your own SQL and notes about your databases. Keep them in this folder: the tool
+reads them from here on every run. `prune` keeps the file from growing without limit.
 
 ## Requirements
 
@@ -112,11 +113,18 @@ Database (sign-in, cached token from a non-TTY shell, silent renewal after expir
 | `update <conn> --table T [--schema s] --set '{json}' --where "..." [--pk Id]` | update (snapshots prior rows) |
 | `delete <conn> --table T [--schema s] --where "..." [--pk Id]` | delete (snapshots removed rows) |
 | `ddl <conn> "<CREATE/ALTER/DROP ...>" \| --file <a.sql>` | DDL (dev/hml only) `[--yes] [--no-tx]` |
-| `log [--all]` | list the mutation history |
+| `exec <conn> "EXEC schema.Proc ..." \| --file <a.sql>` | one procedure call in a transaction that is always rolled back; `[--stats] [--format json] [--out file]` (see [Measuring a procedure](#measuring-a-procedure-exec)) |
+| `log [--all] [--top N]` | the newest N mutations (default 50, oldest first); `--all` includes reverted ones |
 | `show <id> [--full]` | detail one entry (`--full` shows the snapshot) |
 | `revert <id>` | undo one mutation |
 | `revert-last` | undo the most recent non-reverted mutation |
 | `cache-clear` | clear the `result_cache` |
+| `prune [--older-than 30d] [--yes]` | drop journal entries and raw query texts older than N days and expired cache rows, then `VACUUM`; previews without `--yes`. A pruned mutation can no longer be reverted |
+| `catalog <conn> [--refresh]` | read tables, columns, PK, FK, descriptions and row estimates of every schema in one pass |
+| `find <conn> <term> [--schema s] [--top N]` | tables and columns whose name contains `<term>`, grouped across schemas |
+| `context <conn> <table> [--schema s] [--format json]` | everything known about one table, in one block |
+| `joins <conn> <table> [--top N]` | how a table joins: declared FKs plus equalities seen in reads |
+| `history [<conn>] [--table T] [--grep text] [--failed] [--top N] [--raw] [--format json]` | the reads that reached the server, as fingerprints |
 
 Mutations require `--yes`; without it they **dry-run** and print the SQL, the
 affected count, and the snapshot. `--pk` is required in practice for
@@ -202,6 +210,41 @@ dbq exec DEV "EXEC tenant1.usp_Report @Id = 1" --out ./report.json      # every 
 Per-statement cost of a procedure, after running it: `sys.dm_exec_query_stats` × `sys.dm_exec_sql_text`
 filtered by `objectid = OBJECT_ID('<schema>.<proc>')`, ordered by `last_logical_reads`.
 
+## Context: what `dbq.sqlite` remembers
+
+Every read that reaches the server (`query`, `select`, `count`, `exec`) is recorded, and the catalog of a
+connection is one bulk read of `sys.*`. Together they answer "where is X, how does it join, what did I
+already run" without exploring the database again.
+
+| Piece | Kept | Scope |
+|---|---|---|
+| catalog | tables, columns, types, PK, identity, FK, `MS_Description`, estimated rows; read when missing, after 7 days, or with `catalog --refresh` | connection: environments drift between migrations |
+| history | one row per **fingerprint** (the SQL with every literal replaced by `?`, comments and spacing normalized): runs, failures, average time, last row count, last error with its values masked, the tables and procedures it touched, the task label | project |
+| joins | `a.x = b.y` between two tables, mined from reads that succeeded, counted | project |
+
+**Project.** `<CONN>_PROJECT=<name>` in `.env` groups the connections of one system (dev, hml, prd): what
+is learned on one is offered on all. Unset, a connection is its own project, so a database with an
+unrelated structure never mixes in, even with the same table names. The catalog stays per connection.
+
+**Task label.** `DBQ_TASK=<label>` when set, otherwise the git branch of the current directory (read from
+`.git`, git itself is not run).
+
+**What comes back.** `history`, `joins` and `context` print fingerprints, identifiers and counts. The last raw
+text of each read stays in the file for `history --raw` until `prune` drops it; journal values never appear.
+A server error is stored with its quoted values masked (`converting the nvarchar value '?'`), while object
+names stay (`Invalid column name 'Foo'`).
+
+```bash
+node index.js find DEV1 Contract                      # which tables/columns, in how many schemas
+node index.js context DEV1 Contract                   # columns + PK/FK, joins, recent reads, journal counts
+node index.js joins DEV1 Contract
+node index.js history DEV1 --table Contract --failed  # what already failed on this table, and why
+node index.js prune                                   # preview; prune --yes applies
+```
+
+Extraction is a tokenizer, not a parser: CTE names, temp tables, table variables and table-valued functions
+are left out, and a join is recorded only when both sides resolve to a table of the same statement.
+
 ## How revert works
 
 | Operation | What is recorded | Revert |
@@ -250,7 +293,7 @@ Resolution order, in one place (`resolveTarget`):
 1. an explicitly qualified table — `--table tenant1.Contract` or `describe <conn> tenant1.Contract`
 2. `--schema schN`
 3. the connection's own default — `<CONN>_SCHEMA=tenant1` in `.env`, the same sidecar
-   shape as the existing `<CONN>_DESC`
+   shape as `<CONN>_DESC` and `<CONN>_PROJECT`
 4. `DEFAULT_SCHEMA` (`sch`)
 
 Passing both a qualified table and a conflicting `--schema` is an error, not a
@@ -299,7 +342,7 @@ node index.js revert-last
 
 ## Tests
 
-`npm test` (`node --test`) — 147 tests in `test/`, no database or network (the CLI cases run against fake connections via `DBQ_ENV_FILE` and stop before connecting). `main()` runs only behind
+`npm test` (`node --test`) — 175 tests in `test/`, no database or network (the CLI cases run against fake connections via `DBQ_ENV_FILE`, a temp `dbq.sqlite` via `DBQ_DB_FILE`, and stop before connecting; the context storage runs on an in-memory SQLite). `main()` runs only behind
 `require.main === module`, so the module imports cleanly into the tests.
 
 ## License
