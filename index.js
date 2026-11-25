@@ -7,7 +7,8 @@
  * inserted PKs) so it can be reverted.
  *
  * Storage: local SQLite (node:sqlite, built into Node 22+) in dbq.sqlite, one per user, never
- *   committed — journal (with a gzipped snapshot), schema_cache, result_cache, and the context
+ *   committed (DBQ_STATE_DIR, or the state folder of the toolbox that hosts this copy, keeps it out of
+ *   any clone) — journal (with a gzipped snapshot), schema_cache, result_cache, and the context
  *   tables: catalog (tables/columns/PK/FK per connection), query history (fingerprints) and joins.
  *
  * Usage:
@@ -44,9 +45,12 @@
  *   cache-clear                            Clear the result_cache
  *   prune    [--older-than 30d] [--yes]    Drop journal entries and raw query texts older than N days,
  *                                          expired cache rows, then VACUUM. Preview without --yes.
- *   DBQ_JOURNAL_DAYS=<n> (environment, or a line in .env) keeps the journal to the last n days by itself:
- *   every run drops the older entries while the command works, and says so on stderr. Off when unset.
- *   Entries past n days can no longer be reverted; log, show, revert and prune never trigger it.
+ *   The undo lasts 3 days: every run drops the journal entries older than that while the command works,
+ *   and says so on stderr (counts only). DBQ_JOURNAL_DAYS=<n> (environment, or a line in .env) changes
+ *   the window; 0 or off turns it off. An entry past the window can no longer be reverted (revert says
+ *   so, log marks it EXPIRED); log, show, revert and prune never drop entries themselves.
+ *   Opening dbq.sqlite also drops expired result_cache rows and expired credentials (counts on stderr),
+ *   and VACUUMs once a large removal leaves a quarter of the file free.
  *
  * Context (what dbq.sqlite remembers; every read that reaches the server is recorded):
  *   catalog  <conn> [--refresh]            Tables/columns/PK/FK/descriptions of every schema, one bulk
@@ -85,6 +89,7 @@
  *     An unterminated literal or comment is refused (fails closed).
  *   - DBQ_ENV_FILE=<path> reads connections from another .env (tests; announced on stderr).
  *     DBQ_DB_FILE=<path> uses another dbq.sqlite (tests).
+ *     DBQ_STATE_DIR=<folder> (environment, or a line in .env) is where dbq.sqlite lives.
  *   - A connection WITHOUT Password= in .env uses a session password: resolved via the
  *     DBQ_PASSWORD env var, the 'auth' cache (with a TTL) or an interactive prompt.
  *     It never lives in a config file.
@@ -103,6 +108,7 @@ process.emitWarning = (warning, ...rest) => {
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 const { gzipSync, gunzipSync } = require('node:zlib');
 const { DatabaseSync } = require('node:sqlite');
@@ -118,7 +124,6 @@ try {
 const ctx = require('./lib/context.js');
 
 const ROOT = __dirname;
-const DB_PATH = process.env.DBQ_DB_FILE ? path.resolve(process.env.DBQ_DB_FILE) : path.join(ROOT, 'dbq.sqlite');
 const CONFIG_PATH = path.join(ROOT, 'connections.json');
 // DBQ_ENV_FILE points at another .env — the test suite uses it to run the CLI against fake
 // connections without touching the real file. It is not a new trust boundary (whoever sets the
@@ -252,10 +257,104 @@ function editDistance(a, b) {
 }
 
 // ------------------------------------------------------------- sqlite ----
+// dbq.sqlite holds real rows (journal snapshots, read history), so it belongs outside any clone:
+// inside a working tree only .gitignore kept it from a `git add`, and every worktree had its own
+// journal. Where it lives, first that applies: DBQ_DB_FILE (the file itself); DBQ_STATE_DIR
+// (environment, or a line in .env); the state folder of the toolbox that hosts this copy, when it
+// ships one two folders up (scripts/local.mjs, pastaDeEstado); this folder, as it always was.
+
+// ESM: requiring a .mjs works from Node 22.12. Only a missing module is tolerated; any other failure
+// (older Node) shows, instead of the state silently going back into the clone.
+function loadHostState() {
+  try { return require('../../scripts/local.mjs'); }
+  catch (e) { if (e.code === 'MODULE_NOT_FOUND') return null; throw e; }
+}
+
+/** The folder for dbq.sqlite (see above). `home` expands a leading `~`; a relative path is taken from this folder. */
+function resolveStateDir({ env = process.env, envText = readEnvText(), host = loadHostState, home = os.homedir() } = {}) {
+  const configured = ctx.settingFromEnv('DBQ_STATE_DIR', env.DBQ_STATE_DIR, envText);
+  if (configured) return path.resolve(ROOT, configured.replace(/^~(?=$|[\\/])/, home));
+  const h = host();
+  return h ? h.pastaDeEstado('dbq') : ROOT;
+}
+
+function readEnvText() {
+  try { return fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, 'utf8') : ''; } catch (_) { return ''; }
+}
+
+// Moving without ever overwriting: a hard link fails when the target exists, then the source goes.
+// A source held open (Windows, antivirus) undoes the link so the file stays single and intact.
+const NO_LINK = new Set(['EXDEV', 'EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS']);
+const TARGET_TAKEN = new Set(['EEXIST', 'ENOTEMPTY']);
+const SOURCE_HELD = new Set(['EPERM', 'EBUSY', 'EACCES']);
+function moveFile(from, to) {
+  if (!fs.existsSync(from)) return 'absent';
+  if (fs.existsSync(to)) return 'conflict';
+  fs.mkdirSync(path.dirname(to), { recursive: true, mode: 0o700 });
+  try {
+    try { fs.linkSync(from, to); }
+    catch (e) { if (!NO_LINK.has(e.code)) throw e; fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL); }
+    try { fs.unlinkSync(from); }
+    catch (e) {
+      if (e.code === 'ENOENT') return 'moved';
+      try { fs.unlinkSync(to); } catch (_) { /* left for the next run */ }
+      throw e;
+    }
+  } catch (e) {
+    if (e.code === 'ENOENT') return fs.existsSync(to) ? 'moved' : 'absent';
+    if (TARGET_TAKEN.has(e.code)) return 'conflict';
+    if (SOURCE_HELD.has(e.code)) return fs.existsSync(to) ? 'conflict' : 'busy';
+    throw e;
+  }
+  return 'moved';
+}
+
+/**
+ * Older versions kept dbq.sqlite in this folder: when it lives elsewhere now, the first run that opens
+ * the database moves it there, once, never overwriting. Returns the path this run uses. On conflict
+ * (two old copies) the new one wins and the old one stays, with a warning. When it could not be moved
+ * (another dbq holding the file open), this run keeps the old one rather than opening an empty
+ * database beside it; the next run tries again.
+ */
+function migrateLegacyDb(legacyDir = ROOT, stateDir = resolveStateDir()) {
+  const target = path.join(stateDir, 'dbq.sqlite');
+  if (path.resolve(legacyDir) === path.resolve(stateDir)) return target;
+  const from = path.join(legacyDir, 'dbq.sqlite');
+  let r;
+  try { r = moveFile(from, target); }
+  catch (e) {
+    console.error(`-- could not move ${from} to ${stateDir} (${e.code || e.message}); this run keeps using it, the next one tries again`);
+    return from;
+  }
+  if (r === 'busy') {
+    console.error(`-- ${from} is in use and was not moved to ${stateDir}; this run keeps using it, the next one tries again`);
+    return from;
+  }
+  if (r === 'conflict') {
+    console.error(`-- ${from} was not moved: ${target} already exists. Using the new one; the old file stays where it is ` +
+      '(its journal holds real rows: delete it once nothing there needs a revert)');
+  } else if (r === 'moved') {
+    // A rollback journal left by an interrupted run goes with the database (without it SQLite cannot
+    // undo the half-done transaction); -wal/-shm in case the mode ever changes.
+    for (const side of ['-journal', '-wal', '-shm']) {
+      try { moveFile(from + side, target + side); } catch (_) { /* the database moved; SQLite recreates these */ }
+    }
+  }
+  return target;
+}
+
+let _dbPath;
+function dbPath() {
+  if (_dbPath) return _dbPath;
+  _dbPath = process.env.DBQ_DB_FILE ? path.resolve(process.env.DBQ_DB_FILE) : migrateLegacyDb();
+  return _dbPath;
+}
+
 let _db;
 function db() {
   if (_db) return _db;
-  _db = new DatabaseSync(DB_PATH);
+  fs.mkdirSync(path.dirname(dbPath()), { recursive: true });
+  _db = new DatabaseSync(dbPath());
   _db.exec(`
     CREATE TABLE IF NOT EXISTS journal (
       seq          INTEGER PRIMARY KEY,
@@ -302,7 +401,25 @@ function db() {
     );
   `);
   ctx.initContextSchema(_db);
+  purgeExpiredOnOpen(_db);
   return _db;
+}
+
+// Expired rows leave as the database opens: result_cache holds the real rows of a query and
+// credentials a password, and neither is of any use past its expiry. Only counts reach stderr. A busy
+// database (another dbq writing) is left for the next run.
+function purgeExpiredOnOpen(d) {
+  try {
+    const { cache, credentials } = ctx.purgeExpired(d);
+    const parts = [];
+    if (cache) parts.push(`${cache} expired cache entr${cache === 1 ? 'y' : 'ies'}`);
+    if (credentials) parts.push(`${credentials} expired credential${credentials === 1 ? '' : 's'}`);
+    if (parts.length) { console.error(`-- dbq.sqlite: ${parts.join(', ')} removed`); compactDb(d); }
+  } catch (_) { /* busy database: the next run tries again */ }
+}
+
+function compactDb(d) {
+  try { if (ctx.compactIfWorthIt(d)) console.error('-- dbq.sqlite compacted (VACUUM)'); } catch (_) { /* busy: later */ }
 }
 
 // --------------------------------------------------------- connections ----
@@ -601,8 +718,8 @@ function assertDdlAllowed(name) {
 
 // -------------------------------------------------------------- journal ----
 function nextSeq() {
-  const r = db().prepare('SELECT MAX(seq) AS m FROM journal').get();
-  return (r && r.m ? r.m : 0) + 1;
+  // Never below a seq that expired: an old `revert <n>` must not reach a newer mutation.
+  return ctx.journalHighWater(db()) + 1;
 }
 
 function writeJournalEntry(entry) {
@@ -632,6 +749,10 @@ function findEntry(id) {
   const d = db();
   let row = d.prepare('SELECT * FROM journal WHERE seq=?').get(Number(id));
   if (!row) row = d.prepare('SELECT * FROM journal WHERE id=?').get(String(id));
+  if (!row && /^\d+$/.test(String(id)) && Number(id) <= ctx.journalHighWater(d)) {
+    fail(`Journal entry #${id} expired: entries older than the undo window leave the journal ` +
+      '(DBQ_JOURNAL_DAYS, 3 days by default) and can no longer be reverted.');
+  }
   if (!row) fail(`Journal entry "${id}" not found.`);
   return rowToEntry(row);
 }
@@ -1825,8 +1946,9 @@ function cmdLog(flags) {
      FROM journal ${filter} ORDER BY seq DESC LIMIT ?`).all(top).reverse();
   if (rows.length === 0) { console.log('(journal empty)'); return; }
   if (total > rows.length) console.log(`(newest ${rows.length} of ${total}; --top N for more, max ${MAX_TOP})`);
+  const { days } = journalDays();
   for (const e of rows) {
-    const rev = e.reverted ? ' [REVERTED]' : '';
+    const rev = e.reverted ? ' [REVERTED]' : (days && ctx.olderThan(e.ts, days) ? ' [EXPIRED]' : '');
     console.log(`#${String(e.seq).padStart(4)} ${e.ts}  ${String(e.op).toUpperCase().padEnd(6)} ${e.connection}:${e.schema}.${e.tbl}  affected=${e.affected}${rev}`);
     if (e.where_clause) console.log(`        where: ${e.where_clause}`);
   }
@@ -1851,7 +1973,7 @@ function cmdPrune(flags) {
   try { days = ctx.parseAgeDays(flags['older-than']); } catch (e) { return fail(e.message); }
   const d = db();
   const plan = ctx.prunePlan(d, days);
-  const sizeOf = () => { try { return fs.statSync(DB_PATH).size; } catch { return 0; } };
+  const sizeOf = () => { try { return fs.statSync(dbPath()).size; } catch { return 0; } };
   const mb = (b) => (b / 1048576).toFixed(1) + ' MB';
   console.log(`prune: older than ${days} day(s) (before ${plan.cutoff.slice(0, 10)})`);
   console.log(`  journal entries      ${plan.journal}  (${plan.journalLive} not reverted: they can no longer be undone)`);
@@ -1964,6 +2086,10 @@ function cmdCacheClear() {
 async function cmdRevert(id, flags) {
   const entry = findEntry(id);
   if (entry.reverted) fail(`Entry #${entry.seq} was already reverted.`);
+  const { days } = journalDays();
+  if (days && ctx.olderThan(entry.timestamp, days)) {
+    fail(`Entry #${entry.seq} expired: it is older than ${days} day(s) (DBQ_JOURNAL_DAYS, 3 by default) and can no longer be reverted.`);
+  }
   assertWritable(entry.connection, flags);
 
   const pool = await getPool(entry.connection);
@@ -2040,22 +2166,32 @@ async function cmdRevertLast(flags) {
 // listing does not change under the reader and an explicit revert is not raced.
 const JOURNAL_COMMANDS = new Set(['log', 'show', 'revert', 'revert-last', 'prune']);
 
-/**
- * Opt-in journal retention: with DBQ_JOURNAL_DAYS=<n> (environment, or a line in .env) every run drops
- * the journal entries older than n days. It is scheduled, not awaited: it runs while the command waits
- * for the server, and a busy or missing dbq.sqlite never fails or delays the command (the next run
- * tries again). What it dropped is announced on stderr, because those mutations can no longer be undone.
- */
-function scheduleJournalRetention() {
+/** The undo window in days (DBQ_JOURNAL_DAYS from the environment or .env; 3 when unset), or null when off. */
+function journalDays() {
   let text = '';
   try { if (fs.existsSync(ENV_PATH)) text = fs.readFileSync(ENV_PATH, 'utf8'); } catch (_) { /* no .env: environment only */ }
-  const { days, bad } = ctx.retentionSetting(process.env.DBQ_JOURNAL_DAYS, text);
-  if (bad !== null) { console.error(`-- DBQ_JOURNAL_DAYS="${bad}" ignored: it takes a number of days, e.g. 5`); return; }
-  if (!days || !fs.existsSync(DB_PATH)) return;
+  return ctx.retentionSetting(process.env.DBQ_JOURNAL_DAYS, text);
+}
+
+/**
+ * Journal retention, on by default (3 days; DBQ_JOURNAL_DAYS=<n> in the environment or .env changes it,
+ * 0 or off turns it off): every run drops the journal entries older than n days. It is scheduled, not
+ * awaited: it runs while the command waits for the server, and a busy or missing dbq.sqlite never fails
+ * or delays the command (the next run tries again). What it dropped is announced on stderr (the count),
+ * because those mutations can no longer be undone.
+ */
+function scheduleJournalRetention() {
+  const { days, bad } = journalDays();
+  if (bad !== null) { console.error(`-- DBQ_JOURNAL_DAYS="${bad}" ignored: it takes a number of days, e.g. 5 (0 or off turns it off)`); return; }
+  if (!days || !fs.existsSync(dbPath())) return;
   setImmediate(() => {
     try {
-      const n = ctx.applyJournalRetention(db(), days);
-      if (n) console.error(`-- journal: ${n} entr${n === 1 ? 'y' : 'ies'} older than ${days} day(s) dropped (DBQ_JOURNAL_DAYS); no longer revertible`);
+      const d = db();
+      const n = ctx.applyJournalRetention(d, days);
+      if (n) {
+        console.error(`-- journal: ${n} entr${n === 1 ? 'y' : 'ies'} older than ${days} day(s) dropped (DBQ_JOURNAL_DAYS); no longer revertible`);
+        compactDb(d);
+      }
     } catch (_) { /* busy database: the next run tries again */ }
   });
 }
@@ -2122,4 +2258,5 @@ module.exports = {
   sqlCode, readOnlyProblem, execProblem, execConnProblem,
   stripSqlNoise, analyzeReadOnlySql, nonProdWriteRefusal, splitDdlBatches, execJsonDocument,
   DEFAULT_SCHEMA, DEFAULT_TOP, MAX_TOP, KNOWN_FLAGS,
+  migrateLegacyDb, resolveStateDir, moveFile,
 };

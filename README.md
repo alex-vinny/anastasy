@@ -15,15 +15,29 @@ the tool on first run — `journal` (a gzipped row snapshot per mutation), `sche
 PK / identity per table, refetched after 7 days), `result_cache` (opt-in cached reads with a TTL), and the
 [context](#context-what-dbqsqlite-remembers) tables: the catalog, the read history and the joins learned from it.
 
+**Where `dbq.sqlite` lives:** the first of these that applies —
+1. `DBQ_DB_FILE` (the file itself; the tests use it);
+2. `DBQ_STATE_DIR`, in the environment or as a line in `.env` (`~` is your home; a relative path starts at this
+   folder) — point it outside any clone, so no `git add` can reach the file and every clone or worktree shares
+   one journal;
+3. the state folder of the toolbox that hosts this copy, when it ships one two folders up
+   (`scripts/local.mjs`, `pastaDeEstado('dbq')`);
+4. this folder, as before.
+
+Older versions kept it in this folder: when it lives elsewhere now, the first run that opens the database moves
+it there by itself, once, never overwriting (if a `dbq.sqlite` is already there, dbq says so on stderr, uses
+that one and leaves the old file where it is).
+
 **Local files, never committed** (all in `.gitignore`): `.env` (connections), `dbq.sqlite` (the journal holds
 real row snapshots and the history the last raw text of each read, so treat it as the data it came from), and
-`recipes/`, a free folder for your own SQL and notes about your databases. Keep them in this folder: the tool
-reads them from here on every run. `prune` keeps the file from growing without limit, and
-`DBQ_JOURNAL_DAYS` does it for the journal by itself ([Journal retention](#journal-retention-dbq_journal_days)).
+`recipes/`, a free folder for your own SQL and notes about your databases. `.env` and `recipes/` stay in this
+folder: the tool reads them from here on every run. **The undo lasts 3 days**: after that the journal entry
+(with its row snapshot) is gone and the mutation can no longer be reverted; expired cache rows and credentials
+leave as the file opens ([Journal retention](#journal-retention-dbq_journal_days)). `prune` covers the rest.
 
 ## Requirements
 
-- **Node.js 22+** (uses the built-in `node:sqlite`)
+- **Node.js 22+** (uses the built-in `node:sqlite`); **22.12+** when a hosting toolbox ships `scripts/local.mjs` (an ESM module loaded with `require`)
 - `npm install` in this directory once (installs the `mssql` driver)
 - Reachable SQL Server instance(s) and a connection string for each
 
@@ -120,7 +134,7 @@ Database (sign-in, cached token from a non-TTY shell, silent renewal after expir
 | `revert <id>` | undo one mutation |
 | `revert-last` | undo the most recent non-reverted mutation |
 | `cache-clear` | clear the `result_cache` |
-| `prune [--older-than 30d] [--yes]` | drop journal entries and raw query texts older than N days and expired cache rows, then `VACUUM`; previews without `--yes`. A pruned mutation can no longer be reverted |
+| `prune [--older-than 30d] [--yes]` | drop journal entries and raw query texts older than N days and expired cache rows, then `VACUUM`; previews without `--yes`. A pruned mutation can no longer be reverted (the journal already expires by itself after 3 days: [retention](#journal-retention-dbq_journal_days)) |
 | `catalog <conn> [--refresh]` | read tables, columns, PK, FK, descriptions and row estimates of every schema in one pass |
 | `find <conn> <term> [--schema s] [--top N]` | tables and columns whose name contains `<term>`, grouped across schemas |
 | `context <conn> <table> [--schema s] [--format json]` | everything known about one table, in one block |
@@ -265,20 +279,30 @@ comparable length); with nothing close, there is no hint rather than a guess. Hi
 
 ### Journal retention (`DBQ_JOURNAL_DAYS`)
 
-The journal holds real row snapshots. To keep only its last days without remembering to `prune`, set
-`DBQ_JOURNAL_DAYS=<n>` in the environment or as a line in `.env` (`5` or `5d`):
+The journal is there to undo the task at hand, not to archive real rows. **The undo lasts 3 days**, on by
+default; `DBQ_JOURNAL_DAYS=<n>` in the environment or as a line in `.env` (`5` or `5d`) changes the window:
 
 - Every run of a working command (anything but `log`, `show`, `revert`, `revert-last` and `prune`) drops the
   journal entries older than `n` days while the command does its own work. It never delays or fails the
   command: a busy `dbq.sqlite` just leaves it to the next run.
-- What was dropped is announced on stderr (`-- journal: 3 entries older than 5 day(s) dropped …`), because
-  those mutations can no longer be reverted and `context` no longer counts them.
-- There is no `VACUUM`, since other sessions may share the file. The freed pages are zeroed (`secure_delete`)
-  and reused: the snapshots do not linger, and the file stops growing instead of shrinking. `prune` shrinks it.
-- Off when unset. In the environment, `0`, `off`, `false`, `no` or empty turn it off for a run even when `.env`
-  sets it. A value that is not a whole number of days is reported and ignored.
+- What was dropped is announced on stderr (`-- journal: 3 entries older than 3 day(s) dropped …`, the count
+  only), because those mutations can no longer be reverted and `context` no longer counts them.
+- `log`, `show` and `revert` never drop anything themselves, but they respect the window: `log` marks an entry
+  past it `[EXPIRED]`, and `revert` / `revert-last` refuse it (`Entry #7 expired …`) before connecting. A
+  `revert` of a seq already dropped says it expired, and a seq is never handed out again (the highest one is
+  kept in `meta`), so an old `revert <n>` copied from earlier output cannot reach a newer mutation.
+- The freed pages are zeroed (`secure_delete`): the snapshots do not linger in the file.
+- `DBQ_JOURNAL_DAYS=0` (or `off`, `false`, `no`, empty) turns it off; in the environment it wins over `.env`.
+  A value that is not a whole number of days is reported and ignored (nothing is dropped on that run).
 
-Raw query texts and cache rows are left to `prune`.
+**Expired rows leave as `dbq.sqlite` opens**, on any command: `result_cache` rows past their TTL (they hold the
+real rows of a read) and `credentials` past `expires_at` (a session password). An expired Azure AD row that
+carries the authentication record stays, because that record is what renews the token silently; without it,
+every hour would mean a new browser sign-in. Only the counts reach stderr (`-- dbq.sqlite: 12 expired cache
+entries, 1 expired credential removed`). The catalog, `schema_cache`, the read history and `meta` are knowledge
+and stay. After a large removal (at least 1 MB and a quarter of the file free) dbq runs `VACUUM` once to shrink
+the file; otherwise it does not, since it holds the whole file for that moment. Raw query texts are left to
+`prune`.
 
 ## How revert works
 
@@ -377,7 +401,7 @@ node index.js revert-last
 
 ## Tests
 
-`npm test` (`node --test`) — 188 tests in `test/`, no database or network (the CLI cases run against fake connections via `DBQ_ENV_FILE`, a temp `dbq.sqlite` via `DBQ_DB_FILE`, and stop before connecting; the context storage runs on an in-memory SQLite). `main()` runs only behind
+`npm test` (`node --test`) — 203 tests in `test/`, no database or network (the CLI cases run against fake connections via `DBQ_ENV_FILE`, a temp `dbq.sqlite` via `DBQ_DB_FILE`, and stop before connecting; the context storage runs on an in-memory SQLite). `main()` runs only behind
 `require.main === module`, so the module imports cleanly into the tests.
 
 ## License

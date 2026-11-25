@@ -289,15 +289,18 @@ test('prunePlan + applyPrune: old journal and raw texts go, fingerprints and rec
   assert.strictEqual(d.prepare('SELECT COUNT(*) AS n FROM result_cache').get().n, 0);
 });
 
-test('retentionSetting: the environment wins over .env; only whole days turn it on', () => {
+test('retentionSetting: on by default (3 days); the environment wins over .env; only whole days set it', () => {
   const s = c.retentionSetting;
-  assert.deepStrictEqual(s(undefined, ''), { days: null, bad: null });
+  assert.strictEqual(c.DEFAULT_JOURNAL_DAYS, 3);
+  assert.deepStrictEqual(s(undefined, ''), { days: 3, bad: null });
   assert.deepStrictEqual(s('5', 'DBQ_JOURNAL_DAYS=30'), { days: 5, bad: null });
   assert.deepStrictEqual(s(undefined, 'A=Data Source=x\nDBQ_JOURNAL_DAYS=7\n'), { days: 7, bad: null });
   // the last line wins, like any other key of the file; quotes and the 3d form are accepted
   assert.deepStrictEqual(s(undefined, 'DBQ_JOURNAL_DAYS=7\r\n  DBQ_JOURNAL_DAYS = "3d" \r\n'), { days: 3, bad: null });
-  // a commented line or another key is not the setting
-  assert.deepStrictEqual(s(undefined, '# DBQ_JOURNAL_DAYS=5\nXDBQ_JOURNAL_DAYS=5'), { days: null, bad: null });
+  // a commented line or another key is not the setting: the default stays
+  assert.deepStrictEqual(s(undefined, '# DBQ_JOURNAL_DAYS=5\nXDBQ_JOURNAL_DAYS=5'), { days: 3, bad: null });
+  // off in the .env turns the default off too
+  assert.deepStrictEqual(s(undefined, 'DBQ_JOURNAL_DAYS=0'), { days: null, bad: null });
   // an explicit off in the environment beats the file
   for (const off of ['', '0', '0d', 'off', 'FALSE', 'no']) assert.deepStrictEqual(s(off, 'DBQ_JOURNAL_DAYS=9'), { days: null, bad: null }, off);
   // a typo must not delete history: it stays off and is reported
@@ -325,6 +328,7 @@ test('applyJournalRetention: the dropped snapshot does not linger in the file (n
   try {
     let d = new DatabaseSync(file);
     d.exec('CREATE TABLE journal (seq INTEGER PRIMARY KEY, ts TEXT, statement TEXT, snapshot_gz BLOB, reverted INTEGER DEFAULT 0)');
+    d.exec('CREATE TABLE meta ( key TEXT PRIMARY KEY, val TEXT )'); // as in dbq.sqlite: the seq high-water mark goes there
     d.prepare('INSERT INTO journal (ts, statement, snapshot_gz) VALUES (?,?,?)')
       .run('2020-01-01T00:00:00.000Z', marker + 'statement', Buffer.from((marker + 'blob;').repeat(2000))); // spills into overflow pages
     d.prepare('INSERT INTO journal (ts, statement) VALUES (?,?)').run(new Date().toISOString(), 'recent');
@@ -336,6 +340,65 @@ test('applyJournalRetention: the dropped snapshot does not linger in the file (n
     d.close();
     assert.ok(!fs.readFileSync(file).includes(marker), 'the snapshot bytes are gone from the file');
     assert.strictEqual(fs.statSync(file).size, sizeBefore); // the pages stay, zeroed, for the next entries
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('purgeExpired: expired cache rows and credentials go; a renewable Azure AD row, the rest of the file stays', () => {
+  const d = memoryDb();
+  d.exec(`DROP TABLE result_cache;
+          CREATE TABLE result_cache (hash TEXT PRIMARY KEY, connection TEXT, sql TEXT, rows_json TEXT, fetched_at TEXT, ttl_sec INTEGER);
+          CREATE TABLE credentials (connection TEXT PRIMARY KEY, secret TEXT, expires_at TEXT, created_at TEXT);
+          CREATE TABLE schema_cache (key TEXT PRIMARY KEY, fetched_at TEXT);
+          INSERT INTO schema_cache VALUES ('k', '2020-01-01T00:00:00.000Z');`);
+  const now = Date.parse('2026-03-10T12:00:00.000Z');
+  const cache = d.prepare('INSERT INTO result_cache (hash, fetched_at, ttl_sec) VALUES (?,?,?)');
+  cache.run('gone', '2026-03-10T11:54:00.000Z', 300); // 360 s old, ttl 300
+  cache.run('kept', '2026-03-10T11:56:00.000Z', 300); // 240 s old
+  const b64 = (o) => Buffer.from(typeof o === 'string' ? o : JSON.stringify(o)).toString('base64');
+  const cred = d.prepare('INSERT INTO credentials (connection, secret, expires_at) VALUES (?,?,?)');
+  cred.run('PWD_OLD', b64('pwd'), '2026-03-10T11:00:00.000Z');
+  cred.run('PWD_LIVE', b64('pwd'), '2026-03-10T13:00:00.000Z');
+  cred.run('AAD_REC', b64({ kind: 'aad', token: 't', record: '{}' }), '2026-03-10T11:00:00.000Z');
+  cred.run('AAD_NOREC', b64({ kind: 'aad', token: 't' }), '2026-03-10T11:00:00.000Z');
+  assert.deepStrictEqual(c.purgeExpired(d, now), { cache: 1, credentials: 2 });
+  assert.deepStrictEqual(d.prepare('SELECT hash FROM result_cache').all().map(x => x.hash), ['kept']);
+  assert.deepStrictEqual(d.prepare('SELECT connection FROM credentials ORDER BY connection').all().map(x => x.connection), ['AAD_REC', 'PWD_LIVE']);
+  assert.strictEqual(d.prepare('SELECT COUNT(*) AS n FROM schema_cache').get().n, 1); // knowledge, not a leftover
+  assert.deepStrictEqual(c.purgeExpired(d, now), { cache: 0, credentials: 0 });
+});
+
+test('journalHighWater: retention and prune remember the highest seq, so an emptied journal does not restart at 1', () => {
+  const d = memoryDb();
+  const ins = d.prepare('INSERT INTO journal (seq, ts, "table", op) VALUES (?,?,?,?)');
+  ins.run(4, '2020-01-01T00:00:00.000Z', 'T', 'insert');
+  ins.run(5, '2020-01-02T00:00:00.000Z', 'T', 'insert');
+  assert.strictEqual(c.journalHighWater(d), 5);
+  assert.strictEqual(c.applyJournalRetention(d, 3), 2);
+  assert.strictEqual(d.prepare('SELECT COUNT(*) AS n FROM journal').get().n, 0);
+  assert.strictEqual(c.journalHighWater(d), 5);
+  ins.run(6, '2020-01-03T00:00:00.000Z', 'T', 'insert');
+  c.applyPrune(d, c.prunePlan(d, 3));
+  assert.strictEqual(c.journalHighWater(d), 6);
+});
+
+test('compactIfWorthIt: VACUUM only after a large removal', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbq-vac-'));
+  const file = path.join(dir, 'v.sqlite');
+  try {
+    const d = new DatabaseSync(file);
+    d.exec('CREATE TABLE t (b BLOB)');
+    const ins = d.prepare('INSERT INTO t VALUES (?)');
+    for (let i = 0; i < 40; i++) ins.run(Buffer.alloc(64 * 1024, 1));
+    assert.strictEqual(c.compactIfWorthIt(d), false); // nothing free
+    d.exec('DELETE FROM t WHERE rowid <= 4');            // ~256 KB free: below 1 MB
+    assert.strictEqual(c.compactIfWorthIt(d), false);
+    d.exec('DELETE FROM t WHERE rowid <= 30');           // ~1.9 MB free, most of the file
+    const before = fs.statSync(file).size;
+    assert.strictEqual(c.compactIfWorthIt(d), true);
+    assert.ok(fs.statSync(file).size < before / 2);
+    d.close();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -399,49 +462,122 @@ test('CLI prune: a bad --older-than is refused; --yes prunes and reports the siz
   }
 });
 
-test('CLI DBQ_JOURNAL_DAYS: a working command drops the old entries; log does not; unset, off or bad leaves them', () => {
+test('CLI DBQ_JOURNAL_DAYS: on by default (3 days); log does not drop; off or bad leaves them', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbq-ret-cli-'));
   const dbFile = path.join(dir, 'dbq.sqlite');
+  const days = (n) => new Date(Date.now() - n * 86400000).toISOString();
   const seed = () => {
     const d = new DatabaseSync(dbFile);
     d.exec('DELETE FROM journal');
     d.prepare(`INSERT INTO journal (seq, id, ts, op, "table", reverted) VALUES (1, 'old1', '2020-01-01T00:00:00.000Z', 'insert', 'T', 0)`).run();
-    d.prepare(`INSERT INTO journal (seq, id, ts, op, "table", reverted) VALUES (2, 'new1', ?, 'update', 'T', 0)`).run(new Date().toISOString());
+    d.prepare(`INSERT INTO journal (seq, id, ts, op, "table", reverted) VALUES (2, 'mid1', ?, 'delete', 'T', 0)`).run(days(4));
+    d.prepare(`INSERT INTO journal (seq, id, ts, op, "table", reverted) VALUES (3, 'new1', ?, 'update', 'T', 0)`).run(new Date().toISOString());
     d.close();
   };
   const count = () => { const d = new DatabaseSync(dbFile); const n = d.prepare('SELECT COUNT(*) AS n FROM journal').get().n; d.close(); return n; };
   try {
-    runCli(['history'], dbFile); // creates the schema
+    runCli(['history'], dbFile, { env: { DBQ_JOURNAL_DAYS: 'off' } }); // creates the schema
     seed();
-    // unset: nothing happens
-    let r = runCli(['history'], dbFile);
-    assert.strictEqual(count(), 2);
+    // off: nothing happens
+    let r = runCli(['history'], dbFile, { env: { DBQ_JOURNAL_DAYS: 'off' } });
+    assert.strictEqual(count(), 3);
     assert.doesNotMatch(r.err, /journal:/);
-    // a bad value is reported and ignored; the command still runs
+    // a bad value is reported and ignored (no deletion); the command still runs
     r = runCli(['history'], dbFile, { env: { DBQ_JOURNAL_DAYS: 'all' } });
     assert.strictEqual(r.code, 0);
     assert.match(r.err, /DBQ_JOURNAL_DAYS="all" ignored/);
-    assert.strictEqual(count(), 2);
-    // the journal commands never trigger it
-    r = runCli(['log', '--all'], dbFile, { env: { DBQ_JOURNAL_DAYS: '5' } });
-    assert.match(r.out, /2020-01-01/); // the old entry is still listed
-    assert.strictEqual(count(), 2);
-    // a working command does, from the environment; stdout stays the command's own
-    r = runCli(['history'], dbFile, { env: { DBQ_JOURNAL_DAYS: '5' } });
+    assert.strictEqual(count(), 3);
+    // the journal commands never drop; log marks what is past the window
+    r = runCli(['log', '--all'], dbFile);
+    assert.match(r.out, /2020-01-01.*\[EXPIRED\]/);
+    assert.doesNotMatch(r.out.split('\n').find(l => l.startsWith('#   3')), /EXPIRED/);
+    assert.strictEqual(count(), 3);
+    // unset: the default 3 days; stdout stays the command's own
+    r = runCli(['history'], dbFile);
     assert.strictEqual(r.code, 0);
-    assert.match(r.err, /journal: 1 entry older than 5 day\(s\) dropped/);
+    assert.match(r.err, /journal: 2 entries older than 3 day\(s\) dropped/);
     assert.match(r.out, /no read recorded/);
     assert.doesNotMatch(r.out, /journal:/);
     assert.strictEqual(count(), 1);
+    // a wider window from the environment keeps the 4-day-old entry
+    seed();
+    r = runCli(['history'], dbFile, { env: { DBQ_JOURNAL_DAYS: '5' } });
+    assert.match(r.err, /journal: 1 entry older than 5 day\(s\) dropped/);
+    assert.strictEqual(count(), 2);
     // from a line in .env too; an explicit off in the environment wins over the file
     seed();
     r = runCli(['conns'], dbFile, { envLines: ['DBQ_JOURNAL_DAYS=5'], env: { DBQ_JOURNAL_DAYS: 'off' } });
-    assert.strictEqual(count(), 2);
+    assert.strictEqual(count(), 3);
     r = runCli(['conns'], dbFile, { envLines: ['DBQ_JOURNAL_DAYS=5'] });
     assert.strictEqual(r.code, 0);
     assert.match(r.err, /journal: 1 entry older than 5 day\(s\) dropped/);
-    assert.strictEqual(count(), 1);
+    assert.strictEqual(count(), 2);
     assert.doesNotMatch(r.out, /DBQ_JOURNAL_DAYS/); // the setting is not listed as a connection
+    r = runCli(['conns'], dbFile, { envLines: ['DBQ_JOURNAL_DAYS=0'] });
+    assert.strictEqual(count(), 2);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('CLI revert: an entry past the window or already dropped says it expired; the seq is never reused', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbq-ret-rev-'));
+  const dbFile = path.join(dir, 'dbq.sqlite');
+  try {
+    runCli(['history'], dbFile, { env: { DBQ_JOURNAL_DAYS: 'off' } }); // creates the schema
+    let d = new DatabaseSync(dbFile);
+    d.prepare(`INSERT INTO journal (seq, id, ts, op, "table", connection, undo_kind, snapshot_gz, reverted) VALUES (7, 'e7', '2020-01-01T00:00:00.000Z', 'delete', 'T', 'FAKEDEV', 'reinsert', ?, 0)`)
+      .run(require('node:zlib').gzipSync(Buffer.from('{"kind":"reinsert","rows":[]}')));
+    d.close();
+    // still in the journal (log does not drop) but past the window: refused before any connection
+    let r = runCli(['revert', '7'], dbFile);
+    assert.strictEqual(r.code, 1);
+    assert.match(r.err, /Entry #7 expired: it is older than 3 day\(s\)/);
+    assert.doesNotMatch(r.err, /fake-dev|ENOTFOUND|getaddrinfo/);
+    r = runCli(['revert-last'], dbFile);
+    assert.match(r.err, /Entry #7 expired/);
+    // dropped by a working command: the journal is empty, the seq is remembered
+    r = runCli(['history'], dbFile);
+    assert.match(r.err, /journal: 1 entry older than 3 day\(s\) dropped/);
+    r = runCli(['revert', '7'], dbFile);
+    assert.strictEqual(r.code, 1);
+    assert.match(r.err, /Journal entry #7 expired/);
+    r = runCli(['revert', '8'], dbFile);
+    assert.match(r.err, /Journal entry "8" not found/);
+    d = new DatabaseSync(dbFile);
+    assert.strictEqual(c.journalHighWater(d), 7); // the next mutation is #8, never #1 again
+    d.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('CLI: opening dbq.sqlite drops expired cache rows and credentials, counts only on stderr', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbq-exp-cli-'));
+  const dbFile = path.join(dir, 'dbq.sqlite');
+  const secret = 'FICTICIO-SEGREDO-' + 'x'.repeat(10);
+  try {
+    runCli(['history'], dbFile, { env: { DBQ_JOURNAL_DAYS: 'off' } }); // creates the schema
+    let d = new DatabaseSync(dbFile);
+    const cache = d.prepare('INSERT INTO result_cache (hash, connection, sql, rows_json, fetched_at, ttl_sec) VALUES (?,?,?,?,?,?)');
+    cache.run('old', 'FAKEDEV', 'SELECT 1', '[{"nome":"FICTICIO-LINHA"}]', '2020-01-01T00:00:00.000Z', 300);
+    cache.run('new', 'FAKEDEV', 'SELECT 2', '[]', new Date().toISOString(), 300);
+    const cred = d.prepare('INSERT INTO credentials (connection, secret, expires_at, created_at) VALUES (?,?,?,?)');
+    cred.run('OLDPWD', Buffer.from(secret).toString('base64'), '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z');
+    cred.run('LIVEPWD', Buffer.from('y').toString('base64'), new Date(Date.now() + 3600000).toISOString(), new Date().toISOString());
+    cred.run('AADREC', Buffer.from(JSON.stringify({ kind: 'aad', token: 't', record: '{}' })).toString('base64'), '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z');
+    d.close();
+    const r = runCli(['history'], dbFile, { env: { DBQ_JOURNAL_DAYS: 'off' } });
+    assert.strictEqual(r.code, 0);
+    assert.match(r.err, /-- dbq\.sqlite: 1 expired cache entry, 1 expired credential removed/);
+    assert.doesNotMatch(r.err + r.out, /FICTICIO|OLDPWD|SELECT 1/); // counts, never content
+    d = new DatabaseSync(dbFile);
+    assert.deepStrictEqual(d.prepare('SELECT hash FROM result_cache').all().map(x => x.hash), ['new']);
+    assert.deepStrictEqual(d.prepare('SELECT connection FROM credentials ORDER BY connection').all().map(x => x.connection), ['AADREC', 'LIVEPWD']);
+    d.close();
+    assert.ok(!fs.readFileSync(dbFile).includes('FICTICIO-SEGREDO'), 'the expired secret does not linger in the file');
+    // nothing left to expire: silent
+    assert.doesNotMatch(runCli(['history'], dbFile, { env: { DBQ_JOURNAL_DAYS: 'off' } }).err, /dbq\.sqlite/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

@@ -570,8 +570,9 @@ function runCli(args) {
     'FAKEPRDW_READONLY=false',
     'FAKEDEV=Data Source=fake-dev.invalid;Initial Catalog=appdev;User Id=w;Password=x',
   ].join('\n'));
-  // These cases run against the default dbq.sqlite: the retention setting of whoever runs the suite stays out.
-  const env = { ...process.env, DBQ_ENV_FILE: envFile };
+  // A temporary dbq.sqlite and state folder: the journal expires by itself now (3 days by default), and a
+  // test run must never open, let alone prune, the real one. The runner's retention setting stays out.
+  const env = { ...process.env, DBQ_ENV_FILE: envFile, DBQ_DB_FILE: path.join(dir, 'dbq.sqlite'), DBQ_STATE_DIR: path.join(dir, 'estado') };
   delete env.DBQ_JOURNAL_DAYS;
   try {
     const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'index.js'), ...args],
@@ -601,3 +602,95 @@ test('CLI query: DECLARE + EXEC is refused before connecting', () => {
   assert.match(r.err, /'query' is read-only/);
   assert.doesNotMatch(r.err, /fake-dev\.invalid|ENOTFOUND|getaddrinfo/);
 });
+
+// ── migrateLegacyDb: dbq.sqlite sai da pasta da ferramenta para a pasta de estado ─────────────
+// Pasta temporária e arquivo fictício: nenhum dbq.sqlite real é aberto.
+{
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const { migrateLegacyDb, resolveStateDir, moveFile } = require('../index.js');
+  const ctx = require('../lib/context.js');
+
+  const pastas = (t) => {
+    const raiz = fs.mkdtempSync(path.join(os.tmpdir(), 'dbq-migra-'));
+    t.after(() => fs.rmSync(raiz, { recursive: true, force: true }));
+    const legado = path.join(raiz, 'ferramenta');
+    fs.mkdirSync(legado);
+    return { legado, estado: path.join(raiz, 'estado', 'dbq') };
+  };
+
+  test('migrateLegacyDb: move dbq.sqlite e o rollback journal, uma vez', (t) => {
+    const { legado, estado } = pastas(t);
+    fs.writeFileSync(path.join(legado, 'dbq.sqlite'), 'ficticio');
+    fs.writeFileSync(path.join(legado, 'dbq.sqlite-journal'), 'ficticio-j');
+    assert.strictEqual(migrateLegacyDb(legado, estado), path.join(estado, 'dbq.sqlite'));
+    assert.strictEqual(fs.readFileSync(path.join(estado, 'dbq.sqlite'), 'utf8'), 'ficticio');
+    assert.ok(fs.existsSync(path.join(estado, 'dbq.sqlite-journal')));
+    assert.deepStrictEqual(fs.readdirSync(legado), []);
+    assert.strictEqual(migrateLegacyDb(legado, estado), path.join(estado, 'dbq.sqlite'));
+  });
+
+  test('migrateLegacyDb: sem banco antigo, usa a pasta de estado sem criar nada', (t) => {
+    const { legado, estado } = pastas(t);
+    assert.strictEqual(migrateLegacyDb(legado, estado), path.join(estado, 'dbq.sqlite'));
+    assert.ok(!fs.existsSync(estado));
+  });
+
+  test('migrateLegacyDb: em conflito vale o novo e o antigo fica intacto', (t) => {
+    const { legado, estado } = pastas(t);
+    fs.mkdirSync(estado, { recursive: true });
+    fs.writeFileSync(path.join(estado, 'dbq.sqlite'), 'novo');
+    fs.writeFileSync(path.join(legado, 'dbq.sqlite'), 'antigo');
+    assert.strictEqual(migrateLegacyDb(legado, estado), path.join(estado, 'dbq.sqlite'));
+    assert.strictEqual(fs.readFileSync(path.join(estado, 'dbq.sqlite'), 'utf8'), 'novo');
+    assert.strictEqual(fs.readFileSync(path.join(legado, 'dbq.sqlite'), 'utf8'), 'antigo');
+  });
+
+  test('migrateLegacyDb: pasta de estado igual a da ferramenta nao move nada', (t) => {
+    const { legado } = pastas(t);
+    fs.writeFileSync(path.join(legado, 'dbq.sqlite'), 'x');
+    assert.strictEqual(migrateLegacyDb(legado, legado), path.join(legado, 'dbq.sqlite'));
+    assert.deepStrictEqual(fs.readdirSync(legado), ['dbq.sqlite']);
+  });
+
+  test('moveFile: nunca sobrescreve e diz quando nao havia o que mover', (t) => {
+    const { legado, estado } = pastas(t);
+    assert.strictEqual(moveFile(path.join(legado, 'nada'), path.join(estado, 'nada')), 'absent');
+    fs.writeFileSync(path.join(legado, 'a'), '1');
+    fs.mkdirSync(estado, { recursive: true });
+    fs.writeFileSync(path.join(estado, 'a'), '2');
+    assert.strictEqual(moveFile(path.join(legado, 'a'), path.join(estado, 'a')), 'conflict');
+    assert.strictEqual(fs.readFileSync(path.join(estado, 'a'), 'utf8'), '2');
+  });
+
+  // Onde mora o dbq.sqlite: ambiente > linha do .env > pasta de estado do hospedeiro > pasta da ferramenta.
+  const semHost = () => null;
+  const hostEm = (pasta) => () => ({ pastaDeEstado: (nome) => path.join(pasta, nome) });
+  const RAIZ = path.resolve(__dirname, '..');
+
+  test('resolveStateDir: DBQ_STATE_DIR do ambiente vence o .env e o hospedeiro', () => {
+    const r = resolveStateDir({ env: { DBQ_STATE_DIR: '/tmp/a' }, envText: 'DBQ_STATE_DIR=/tmp/b', host: hostEm('/tmp/h') });
+    assert.strictEqual(r, path.resolve('/tmp/a'));
+  });
+
+  test('resolveStateDir: linha do .env vale sem a variavel; ~ vira a home', () => {
+    const r = resolveStateDir({ env: {}, envText: 'X=1\nDBQ_STATE_DIR="~/estado-dbq"', host: hostEm('/tmp/h'), home: '/home/dev' });
+    assert.strictEqual(r, path.resolve('/home/dev/estado-dbq'));
+  });
+
+  test('resolveStateDir: sem configuracao, a pasta de estado do hospedeiro; sem hospedeiro, a da ferramenta', () => {
+    assert.strictEqual(resolveStateDir({ env: {}, envText: '', host: hostEm('/tmp/h') }), path.join('/tmp/h', 'dbq'));
+    assert.strictEqual(resolveStateDir({ env: {}, envText: '', host: semHost }), RAIZ);
+  });
+
+  test('resolveStateDir: caminho relativo e a partir da pasta da ferramenta', () => {
+    assert.strictEqual(resolveStateDir({ env: { DBQ_STATE_DIR: 'dados' }, envText: '', host: semHost }), path.join(RAIZ, 'dados'));
+  });
+
+  test('settingFromEnv: o ambiente vence, a ultima linha do .env vale e as aspas saem', () => {
+    assert.strictEqual(ctx.settingFromEnv('K', 'amb', 'K=arq'), 'amb');
+    assert.strictEqual(ctx.settingFromEnv('K', undefined, "K=1\nK='2'"), '2');
+    assert.strictEqual(ctx.settingFromEnv('K', undefined, 'OUTRO=1'), undefined);
+  });
+}
